@@ -43,13 +43,26 @@ VARIANTS_BY_PLATFORM: Final = {
     "linux": frozenset(("appimage", "deb", "rpm")),
     "windows": frozenset(("msi", "nsis")),
     "macos": frozenset(("app", "dmg")),
-    "rescue": frozenset(("qualified-iso", "qualified-zip", "retail-img-xz")),
+    "rescue": frozenset(
+        (
+            "qualified-iso",
+            "qualified-zip",
+            "retail-img-xz",
+            "repair-qualified-iso",
+            "repair-qualified-zip",
+            "repair-retail-img-xz",
+        )
+    ),
 }
 KINDS: Final = frozenset(
     ("package", "image", "checksum", "qualification", "sbom", "signature")
 )
-WORKFLOWS: Final = frozenset(
-    (".github/workflows/desktop.yml", ".github/workflows/rescue.yml")
+DESKTOP_WORKFLOW: Final = ".github/workflows/desktop.yml"
+RESCUE_WORKFLOW: Final = ".github/workflows/rescue.yml"
+REPAIR_WORKFLOW: Final = ".github/workflows/rescue-repair-candidate.yml"
+WORKFLOWS: Final = frozenset((DESKTOP_WORKFLOW, RESCUE_WORKFLOW, REPAIR_WORKFLOW))
+REPAIR_VARIANTS: Final = frozenset(
+    ("repair-qualified-iso", "repair-qualified-zip", "repair-retail-img-xz")
 )
 
 
@@ -238,13 +251,17 @@ def _url(value: object, filename: str, label: str) -> str:
     return value
 
 
-def _provenance(value: object, component: str, label: str) -> dict[str, Any]:
+def _provenance(
+    value: object, component: str, variant: str, label: str
+) -> dict[str, Any]:
     provenance = _exact_object(value, {"runAttempt", "runId", "workflow"}, label)
     workflow = _choice(provenance["workflow"], WORKFLOWS, f"{label}.workflow")
     expected_workflow = (
-        ".github/workflows/desktop.yml"
+        DESKTOP_WORKFLOW
         if component == "desk"
-        else ".github/workflows/rescue.yml"
+        else REPAIR_WORKFLOW
+        if variant in REPAIR_VARIANTS
+        else RESCUE_WORKFLOW
     )
     if workflow != expected_workflow:
         raise ReleaseChannelError(f"{label}.workflow does not match the component")
@@ -294,7 +311,9 @@ def _artifact_common(value: object, label: str, *, input_document: bool) -> dict
         "kind": kind,
         "mediaType": media_type,
         "platform": platform,
-        "provenance": _provenance(artifact["provenance"], component, f"{label}.provenance"),
+        "provenance": _provenance(
+            artifact["provenance"], component, variant, f"{label}.provenance"
+        ),
         "variant": variant,
         "version": version,
     }
@@ -332,11 +351,24 @@ def _artifact_sort_key(artifact: Mapping[str, Any]) -> tuple[str, ...]:
     )
 
 
-def _validate_artifact_set(artifacts: list[dict[str, Any]], *, require_sorted: bool) -> None:
+def _validate_artifact_set(
+    artifacts: list[dict[str, Any]], *, channel: str, require_sorted: bool
+) -> None:
     if not 1 <= len(artifacts) <= 64:
         raise ReleaseChannelError("artifacts must contain between 1 and 64 entries")
     if require_sorted and artifacts != sorted(artifacts, key=_artifact_sort_key):
         raise ReleaseChannelError("artifacts are not in canonical order")
+
+    repair = [artifact for artifact in artifacts if artifact["variant"] in REPAIR_VARIANTS]
+    if repair:
+        if channel != "repair-internal" or len(repair) != len(artifacts):
+            raise ReleaseChannelError(
+                "Repair artifacts require the isolated repair-internal channel"
+            )
+    elif channel == "repair-internal":
+        raise ReleaseChannelError(
+            "repair-internal channel requires exclusively Repair artifacts"
+        )
 
     names: set[str] = set()
     urls: set[str] = set()
@@ -390,7 +422,7 @@ def build_manifest(descriptor: Mapping[str, Any]) -> dict[str, Any]:
         for index, value in enumerate(raw_artifacts)
     ]
     artifacts.sort(key=_artifact_sort_key)
-    _validate_artifact_set(artifacts, require_sorted=True)
+    _validate_artifact_set(artifacts, channel=channel, require_sorted=True)
     return {
         "artifacts": artifacts,
         "channel": channel,
@@ -422,7 +454,7 @@ def validate_manifest(document: Mapping[str, Any]) -> dict[str, Any]:
         _artifact_common(value, f"artifacts[{index}]", input_document=False)
         for index, value in enumerate(raw_artifacts)
     ]
-    _validate_artifact_set(artifacts, require_sorted=True)
+    _validate_artifact_set(artifacts, channel=channel, require_sorted=True)
     return {
         "artifacts": artifacts,
         "channel": channel,

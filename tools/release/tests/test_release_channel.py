@@ -25,10 +25,16 @@ class ReleaseChannelTests(unittest.TestCase):
         self.rescue = self.root / "KernAid-Rescue-amd64-qualified.zip"
         self.qualification = self.root / "KernAid-Rescue-amd64.qualified.json"
         self.retail = self.root / "KernAid-Rescue-amd64-retail.img.xz"
+        self.repair_iso = self.root / "KernAid-Rescue-Repair-amd64.iso"
+        self.repair_manifest = self.root / (
+            "KernAid-Rescue-Repair-amd64.qualified.json"
+        )
         self.desk.write_bytes(b"desk-package-v1\0" * 31)
         self.rescue.write_bytes(b"rescue-image-v1\0" * 37)
         self.qualification.write_bytes(b'{"qualified":true}\n')
         self.retail.write_bytes(b"compressed-retail-image-v1\0" * 29)
+        self.repair_iso.write_bytes(b"repair-qualified-iso-v1\0" * 31)
+        self.repair_manifest.write_bytes(b'{"repairEnabled":true}\n')
         self.descriptor = self.root / "descriptor.json"
         self.manifest = self.root / "channel.json"
 
@@ -278,6 +284,87 @@ class ReleaseChannelTests(unittest.TestCase):
         self.assertIn(
             "retail-img-xz", schema["$defs"]["artifact"]["properties"]["variant"]["enum"]
         )
+        self.assertIn(
+            "repair-qualified-iso",
+            schema["$defs"]["artifact"]["properties"]["variant"]["enum"],
+        )
+        self.assertIn(
+            ".github/workflows/rescue-repair-candidate.yml",
+            schema["$defs"]["provenance"]["properties"]["workflow"]["enum"],
+        )
+
+    def repair_descriptor(self) -> dict[str, object]:
+        artifacts = [
+            self.artifact(
+                component="rescue",
+                platform="rescue",
+                kind="image",
+                path=self.repair_iso,
+                media_type="application/octet-stream",
+                variant="repair-qualified-iso",
+            ),
+            self.artifact(
+                component="rescue",
+                platform="rescue",
+                kind="qualification",
+                path=self.repair_manifest,
+                media_type="application/json",
+                variant="repair-qualified-iso",
+            ),
+        ]
+        for artifact in artifacts:
+            artifact["provenance"]["workflow"] = (  # type: ignore[index]
+                ".github/workflows/rescue-repair-candidate.yml"
+            )
+        return {
+            "artifacts": artifacts,
+            "channel": "repair-internal",
+            "previous": None,
+            "publishedAt": "2026-08-28T12:00:00Z",
+            "schema": "dev.kernaid.release-channel-input.v1",
+            "sequence": 1,
+            "source": {"commit": COMMIT, "repository": "0xfunboy/KernAid"},
+        }
+
+    def test_repair_channel_accepts_only_repair_workflow_and_variants(self) -> None:
+        self.write_descriptor(self.repair_descriptor())
+        created = self.run_create()
+        self.assertEqual(created.returncode, 0, created.stderr)
+        manifest = json.loads(self.manifest.read_text(encoding="ascii"))
+        self.assertEqual(manifest["channel"], "repair-internal")
+        self.assertTrue(
+            all(
+                artifact["variant"].startswith("repair-")
+                for artifact in manifest["artifacts"]
+            )
+        )
+        self.assertEqual(self.run_verify().returncode, 0)
+
+    def test_repair_variant_refuses_stable_rescue_provenance(self) -> None:
+        document = self.repair_descriptor()
+        document["artifacts"][0]["provenance"]["workflow"] = (  # type: ignore[index]
+            ".github/workflows/rescue.yml"
+        )
+        self.write_descriptor(document)
+        result = self.run_create()
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("workflow does not match", result.stderr)
+
+    def test_repair_artifacts_refuse_the_stable_internal_channel(self) -> None:
+        document = self.repair_descriptor()
+        document["channel"] = "internal"
+        self.write_descriptor(document)
+        result = self.run_create()
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("isolated repair-internal channel", result.stderr)
+
+    def test_repair_channel_refuses_diagnosis_only_artifacts(self) -> None:
+        document = self.descriptor_document()
+        document["channel"] = "repair-internal"
+        self.write_descriptor(document)
+        result = self.run_create()
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("requires exclusively Repair artifacts", result.stderr)
 
     def test_publisher_splits_and_reverifies_the_retail_asset(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

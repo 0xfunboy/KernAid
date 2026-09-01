@@ -197,8 +197,9 @@ class RepairCandidatePackagingTests(unittest.TestCase):
             source[gate:handler],
         )
 
-    def test_candidate_workflow_is_manual_isolated_and_publishes_only_iso(self) -> None:
+    def test_candidate_workflow_is_manual_and_promotes_only_after_the_gate(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
+        build, qualification = workflow.split("  qualified-repair-release:\n", 1)
         self.assertIn("on:\n  workflow_dispatch:\n", workflow)
         self.assertNotIn("\n  push:", workflow)
         self.assertIn("node-version: 24.18.0", workflow)
@@ -223,9 +224,12 @@ class RepairCandidatePackagingTests(unittest.TestCase):
         self.assertIn("QEMU UEFI Secure Boot candidate smoke test", workflow)
         self.assertIn("./tools/build-rescue/qemu-smoke.sh secureboot", workflow)
         self.assertNotIn("./tools/build-rescue/qemu-smoke.sh uefi", workflow)
-        self.assertIn("name: KernAid-Rescue-amd64-repair-candidate", workflow)
+        self.assertIn("name: KernAid-Rescue-amd64-repair-candidate", build)
         for forbidden in ("catalog-entry", "qualified-release", "deploy-pages"):
-            self.assertNotIn(forbidden, workflow)
+            self.assertNotIn(forbidden, build)
+        self.assertIn("needs: build-and-smoke-test", qualification)
+        self.assertIn("repair-qualification.py verify", qualification)
+        self.assertIn("name: KernAid-Rescue-Repair-amd64-qualified", qualification)
 
     def test_default_profile_contains_no_candidate_artifact_or_client_group(self) -> None:
         absent = (

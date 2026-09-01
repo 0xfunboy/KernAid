@@ -102,9 +102,12 @@ jobs:
         run: |
           python3 -B -m unittest \
             tools/build-rescue/tests/test_repair_candidate_packaging.py \
+            tools/build-rescue/tests/test_repair_qualification.py \
             tools/build-rescue/tests/test_repair_surface_separation.py \
             tools/build-rescue/tests/test_qemu_repair_candidate_smoke.py \
+            tools/build-rescue/tests/test_verify_retail_image.py \
             tools/build-rescue/tests/test_live_image_vault_packaging.py -v
+          python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/repair-qualification.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           python3 -I -B -c 'from pathlib import Path; path = Path("tools/build-rescue/qemu-repair-vault-tamper.py"); compile(path.read_bytes(), str(path), "exec", dont_inherit=True)'
           bash -n tools/build-rescue/build.sh tools/build-rescue/qemu-smoke.sh \
             tools/build-rescue/qemu-repair-candidate-smoke.sh
@@ -258,3 +261,146 @@ jobs:
             KernAid-Rescue-amd64-repair-candidate.iso.sha256
           if-no-files-found: error
           retention-days: 7
+
+  qualified-repair-release:
+    if: github.ref == 'refs/heads/main'
+    needs: build-and-smoke-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24.18.0 }
+      - name: Download the exact same-run Repair candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Rescue-amd64-repair-candidate
+          path: ${{ runner.temp }}/kernaid-repair-qualified-input/image
+      - name: Download the exact same-run Repair evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: KernAid-Rescue-repair-candidate-smoke-logs
+          path: ${{ runner.temp }}/kernaid-repair-qualified-input/evidence
+      - name: Assemble and verify the isolated Repair qualification
+        env:
+          KERNAID_ARTIFACT_VERSION: repair-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          KERNAID_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v24.18.0"
+          input="$RUNNER_TEMP/kernaid-repair-qualified-input"
+          qualified="$RUNNER_TEMP/kernaid-rescue-repair-qualified"
+          install -d -m 0755 -- "$qualified"
+          install -m 0644 -- \
+            "$input/image/KernAid-Rescue-amd64-repair-candidate.iso" \
+            "$qualified/KernAid-Rescue-Repair-amd64.iso"
+          (cd "$qualified" && sha256sum KernAid-Rescue-Repair-amd64.iso \
+            >KernAid-Rescue-Repair-amd64.iso.sha256)
+
+          retail_raw="$RUNNER_TEMP/KernAid-Rescue-Repair-amd64-retail.img"
+          truncate -s 32000000000 -- "$retail_raw"
+          dd if="$qualified/KernAid-Rescue-Repair-amd64.iso" of="$retail_raw" \
+            bs=4M conv=notrunc,sparse status=none
+          env -u XZ_OPT -u XZ_DEFAULTS xz --format=xz --threads=1 \
+            --check=sha256 --lzma2=preset=6 --stdout -- "$retail_raw" \
+            >"$qualified/KernAid-Rescue-Repair-amd64-retail.img.xz"
+          rm -f -- "$retail_raw"
+          python3 -I -B tools/build-rescue/verify-retail-image.py \
+            --variant repair \
+            --iso "$qualified/KernAid-Rescue-Repair-amd64.iso" \
+            --archive "$qualified/KernAid-Rescue-Repair-amd64-retail.img.xz" \
+            --output "$qualified/KernAid-Rescue-Repair-amd64-retail.json"
+          (cd "$qualified" && sha256sum \
+            KernAid-Rescue-Repair-amd64-retail.img.xz \
+            >KernAid-Rescue-Repair-amd64-retail.img.xz.sha256)
+
+          grep -E '^KERNAID_QEMU_ATTESTATION_V1 firmware=bios ' \
+            "$input/evidence/rescue-repair-candidate-bios.log" \
+            >"$qualified/kernaid-rescue-repair-bios.sanitized.log"
+          grep -E \
+            '^KERNAID_QEMU_(ATTESTATION_V1 firmware=uefi|SECURE_BOOT_ATTESTATION_V1 firmware=uefi) ' \
+            "$input/evidence/rescue-repair-candidate-uefi.log" \
+            >"$qualified/kernaid-rescue-repair-uefi.sanitized.log"
+          grep -E \
+            '^KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 ' \
+            "$input/evidence/rescue-repair-candidate-batch.log" \
+            >"$qualified/kernaid-rescue-repair-qualification-batch.sanitized.log"
+
+          manifest_args=(
+            --repository "$GITHUB_REPOSITORY"
+            --commit "$GITHUB_SHA"
+            --run-id "$GITHUB_RUN_ID"
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+            --run-url "$KERNAID_RUN_URL"
+            --artifact-version "$KERNAID_ARTIFACT_VERSION"
+            --iso "$qualified/KernAid-Rescue-Repair-amd64.iso"
+            --checksum "$qualified/KernAid-Rescue-Repair-amd64.iso.sha256"
+            --retail-image "$qualified/KernAid-Rescue-Repair-amd64-retail.img.xz"
+            --retail-checksum "$qualified/KernAid-Rescue-Repair-amd64-retail.img.xz.sha256"
+            --retail-metadata "$qualified/KernAid-Rescue-Repair-amd64-retail.json"
+            --bios-evidence "$qualified/kernaid-rescue-repair-bios.sanitized.log"
+            --uefi-evidence "$qualified/kernaid-rescue-repair-uefi.sanitized.log"
+            --batch-evidence "$qualified/kernaid-rescue-repair-qualification-batch.sanitized.log"
+            --catalog "$qualified/KernAid-Rescue-Repair-amd64.catalog-entry.json"
+          )
+          python3 -I -B tools/build-rescue/repair-qualification.py create \
+            "${manifest_args[@]}" \
+            --output "$qualified/KernAid-Rescue-Repair-amd64.qualified.json"
+          python3 -I -B tools/build-rescue/repair-qualification.py verify \
+            "${manifest_args[@]}" \
+            --manifest "$qualified/KernAid-Rescue-Repair-amd64.qualified.json"
+      - name: Attest the Repair ISO build provenance
+        id: attest_repair_provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/kernaid-rescue-repair-qualified/KernAid-Rescue-Repair-amd64.iso
+      - name: Attest the Repair ISO qualification
+        id: attest_repair_qualification
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/kernaid-rescue-repair-qualified/KernAid-Rescue-Repair-amd64.iso
+          predicate-type: https://kernaid.dev/attestations/rescue-repair-qualified-release/v1
+          predicate-path: ${{ runner.temp }}/kernaid-rescue-repair-qualified/KernAid-Rescue-Repair-amd64.qualified.json
+      - name: Attest the Repair retail image qualification
+        id: attest_repair_retail
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/kernaid-rescue-repair-qualified/KernAid-Rescue-Repair-amd64-retail.img.xz
+          predicate-type: https://kernaid.dev/attestations/rescue-repair-qualified-release/v1
+          predicate-path: ${{ runner.temp }}/kernaid-rescue-repair-qualified/KernAid-Rescue-Repair-amd64.qualified.json
+      - name: Include the Repair Sigstore bundles
+        run: |
+          qualified="$RUNNER_TEMP/kernaid-rescue-repair-qualified"
+          install -m 0644 -- \
+            "${{ steps.attest_repair_provenance.outputs.bundle-path }}" \
+            "$qualified/KernAid-Rescue-Repair-amd64.provenance.sigstore.json"
+          install -m 0644 -- \
+            "${{ steps.attest_repair_qualification.outputs.bundle-path }}" \
+            "$qualified/KernAid-Rescue-Repair-amd64.qualification.sigstore.json"
+          install -m 0644 -- \
+            "${{ steps.attest_repair_retail.outputs.bundle-path }}" \
+            "$qualified/KernAid-Rescue-Repair-amd64-retail.qualification.sigstore.json"
+      - name: Publish the qualified Repair bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-Repair-amd64-qualified
+          path: |
+            ${{ runner.temp }}/kernaid-rescue-repair-qualified
+            !${{ runner.temp }}/kernaid-rescue-repair-qualified/KernAid-Rescue-Repair-amd64-retail.img.xz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Publish the qualified Repair retail image separately
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-Repair-amd64-qualified-retail
+          path: ${{ runner.temp }}/kernaid-rescue-repair-qualified/KernAid-Rescue-Repair-amd64-retail.img.xz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
