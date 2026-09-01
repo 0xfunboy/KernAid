@@ -57,10 +57,11 @@ production promotion of repair packs remain open milestones.
 | `crypttab` recovery | `linux.crypttab.disable-missing-uuid.v1` rejects critical mappings, external key sources, ambiguity and mandatory `fstab` consumers; the candidate includes Vault reservation, atomic execution, verification, UI, exact rollback and restart reconciliation. |
 | ext4 recovery | `linux.ext4.fsck-preen-with-undo.v1` is an R3, unmounted-target action using bounded `e2fsck -p -f -z`, read-only verification and same-boot `e2undo`; it explicitly stops for manual reconciliation when exact recovery cannot be proved. |
 | Resolver-link recovery | `linux.network.restore-resolver-link.v1` restores only the fixed resolver symlink after proving exactly one supported resolver, preserves the exact missing/link pre-state in the Vault and never starts or restarts a service. |
-| Fleet control plane | Live internal schema v11: signed enrollment/inventory/audit/policy/entitlement/update delivery, secure browser sessions, RBAC, typed work orders, incident cases and service receipts. Offline Ed25519 commercial licensing is active for the internal tenant; expiry, revocation, seat limits and clock rollback fail closed for paid operations. |
+| Fleet control plane | Live internal schema v12: signed enrollment/inventory/audit/policy/entitlement/update delivery, secure browser sessions, RBAC, typed Linux, Windows and macOS work orders, incident cases and service receipts. Offline Ed25519 commercial licensing is active for the internal tenant; expiry, revocation, seat limits and clock rollback fail closed for paid operations. |
 | Fleet backup | The live SQLite service has a scheduled, signed three-file backup bundle. The online copy is converted from WAL mode into one standalone database before its canonical manifest is signed; offline verify/restore reject tampering, wrong keys, sidecars, symlinks and overwrite. |
 | Linux Fleet Resident | A disabled-by-default amd64 `.deb` packages signed sync, the three closed Linux R0 diagnostic work orders, signed update staging and the UEFI/systemd-boot A/B activator. Installation does not enroll, enable, change boot state or reboot. |
 | Windows Fleet Resident | A separate off-default `LocalService` worker admits only `windows.p0.diagnose.v1@1`, retains digest-only idempotent state and exposes an explicitly unsigned deployment-bundle workflow. It installs on demand and never auto-starts. |
+| macOS Fleet Resident | A separate off-default LaunchAgent worker admits only `macos.p0.diagnose.v1@1`, reuses the bounded native Desk collector and retains digest-only idempotent state. Its Intel and Apple-silicon workflow bundles remain explicitly unsigned and unnotarized. |
 | Rescue Fleet adapter | The private candidate can display an exact Fleet `fstab` repair intent, but execution still requires a fresh local approval bound to device, lease, action, plan, target and evidence before the existing Core/Broker/Vault path is reached. Fleet cannot execute it remotely. |
 | Signed A/B activation | The off-default Linux activator admits only a signed, already staged inactive slot on locally provisioned UEFI/systemd-boot A/B systems. It persists before `bootctl`, uses one-shot boot, promotes or records fallback, retains offline rollback and never repartitions or reboots. BIOS/GRUB fails closed. |
 | Windows Media Creator | The native wizard consumes one exact Ed25519-signed release bundle, lists only qualified removable whole disks, requires exact erase confirmation, streams the XZ image and performs full readback SHA-256. Its workflow output remains an explicitly unsigned EXE/ZIP until Authenticode is applied externally. |
@@ -114,10 +115,11 @@ treated as a newer release.
   readiness (`b82710f`), but that fix has not yet passed a new exact-image run.
 - Secure Boot is not qualified.
 - Desktop installers are unsigned engineering previews.
-- The Linux Resident `.deb`, Windows Resident ZIP and Windows Media Creator ZIP
-  are engineering packaging paths, not released customer installers. Linux
-  repository/package signing, Windows Authenticode, native installation and
-  physical endpoint qualification remain open.
+- The Linux Resident `.deb`, Windows Resident ZIP, macOS Resident bundles and
+  Windows Media Creator ZIP are engineering packaging paths, not released
+  customer installers. Linux repository/package signing, Windows
+  Authenticode, macOS Developer ID signing/notarization, native installation
+  and physical endpoint qualification remain open.
 - The Linux A/B activator requires a separately provisioned and qualified pair
   of bootable slots and UKIs. Its source implementation is not evidence that a
   customer device can be safely updated or rolled back.

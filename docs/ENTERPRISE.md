@@ -35,7 +35,7 @@ schema.
 | `crates/fleet-client`               | Canonical Ed25519 enrollment, inventory and signed work-order claim/result envelopes               | Offline/transport-neutral; reuses the existing protected device identity                         |
 | `crates/fleet-runtime`              | Durable SQLite outbox, inventory sequencing and verified entitlement state                         | External vendor anchor; paid features fail closed while diagnosis/export/rollback stay available |
 | `packages/fleet-schemas`            | Matching Node.js wire validation and canonical signing bytes                                       | Strict bounded v1 schemas                                                                        |
-| `services/fleet-control-plane`      | Tenant registry, signed device traffic, governance, work orders, incidents and commercial licensing | Live loopback origin at schema v11 behind the internal TLS tunnel                                |
+| `services/fleet-control-plane`      | Tenant registry, signed device traffic, governance, work orders, incidents and commercial licensing | Live loopback origin at schema v12 behind the internal TLS tunnel                                |
 | `apps/fleet-console`                | Same-origin inventory, governance, work-order, incident and license UI                               | Short-lived server-memory session, Secure cookie and CSRF; no persistent browser bearer token    |
 | `crates/fleet-policy`               | Offline policy issuer and signed, offline-capable restrictive bundle                               | Server receives no seed; policy can only narrow local permission                                 |
 | `crates/fleet-audit`                | Canonical signed audit events and tamper-evident chain checkpoints                                 | Digest-only device protocol with central signature, sequence and chain verification              |
@@ -46,6 +46,7 @@ schema.
 | `crates/fleet-resident-work-orders` | Durable allowlisted device-side work-order client                                                  | Off-default; Fleet intent never replaces fresh local Core/broker approval                        |
 | `deploy/fleet-resident-linux`       | Disabled-by-default amd64 Debian package for sync, work orders, staging and A/B activation          | Does not enroll, enable services, alter boot state or reboot during installation                 |
 | `deploy/fleet-resident-windows`     | On-demand Windows `LocalService` deployment for `windows.p0.diagnose.v1@1`                          | R0/digest-only; CI ZIP is explicitly unsigned and needs Authenticode/native qualification        |
+| `deploy/fleet-resident-macos`       | Off-default LaunchAgent deployment for `macos.p0.diagnose.v1@1` on Intel and Apple silicon          | R0/digest-only; CI bundles are explicitly unsigned/unnotarized and need native qualification     |
 | `deploy/fleet`                      | Signed online SQLite backup, offline verification/restore and persistent schedule                   | WAL-safe standalone three-file bundle signed by the provisioned service-receipt key              |
 
 The control plane binds every enrolled `KA-…` device ID to the raw Ed25519
@@ -148,7 +149,7 @@ bundle without printing any token value.
 ## Remaining Enterprise RC gates
 
 The internal control plane is running at `https://fleet.funboy.eu.cc/` through
-a loopback-only persistent user service. The live database is schema v11 and
+a loopback-only persistent user service. The live database is schema v12 and
 has one active, non-revoked offline-signed Enterprise license for the internal
 tenant. Fleet receives only public entitlement, update and commercial trust
 anchors; all issuer private keys remain outside its filesystem view.
@@ -156,7 +157,7 @@ anchors; all issuer private keys remain outside its filesystem view.
 The live service also has a persistent scheduled backup. Each online SQLite
 copy is forced into standalone journal mode, checked for integrity/foreign-key
 violations, bound into a canonical manifest and signed with the existing
-service-receipt Ed25519 key. The latest schema-v11 bundle was independently
+service-receipt Ed25519 key. The latest schema-v12 bundle was independently
 verified offline on 1 September 2026. Root and tenant credentials remain
 owner-only and outside source control.
 
@@ -170,9 +171,9 @@ The remaining RC work is:
 3. qualify the local Rescue Fleet `fstab` adapter end to end. Fleet may deliver
    intent, but Desk must still collect a fresh target/evidence-bound approval
    before Core/Broker/Vault can mutate anything;
-4. add a native macOS Resident package and complete publisher signing,
-   notarization/Authenticode, production Access/rate-limit policy and physical
-   endpoint evidence;
+4. qualify the existing native Intel/Apple-silicon macOS Resident bundles and
+   complete publisher signing, notarization/Authenticode, production
+   Access/rate-limit policy and physical endpoint evidence;
 5. qualify each actual repair pack on disposable virtual and physical targets.
 
 Fleet enrollment or a green dashboard is not proof that a repair action is

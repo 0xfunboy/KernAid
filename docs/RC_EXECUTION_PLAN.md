@@ -50,9 +50,11 @@ Integrated in current source, but not automatically qualified or promoted:
   signed update staging and the UEFI/systemd-boot A/B activator;
 - the off-default Windows R0 Resident and its explicitly unsigned deployment
   ZIP workflow;
+- the off-default macOS R0 Resident and its explicitly unsigned/unnotarized
+  Intel and Apple-silicon bundle workflow;
 - the Windows Media Creator wizard, which verifies an offline-signed exact
   release bundle while its EXE/ZIP remains unsigned pending Authenticode;
-- live Fleet schema v11 with active offline commercial licensing and scheduled
+- live Fleet schema v12 with active offline commercial licensing and scheduled
   signed, WAL-safe, independently verified backup bundles; and
 - a gated private software catalog that publishes no slot without exact
   provenance, digest, qualification and signature-state metadata.
