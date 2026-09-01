@@ -97,8 +97,8 @@ The CI workflows are configured to produce engineering-preview desktop installer
   serial numbers, UUIDs, asset tags, bus addresses and arbitrary paths, and
   reports each source as complete, partial, truncated, unavailable or invalid
   instead of converting missing data into a healthy result.
-- **Optional Resident OpenAI reasoning:** configure the public
-  `resident-default` profile from the hidden native TTY prompts of
+- **Optional Resident reasoning:** the current Desk integration can configure
+  the public `resident-default` profile from the hidden native TTY prompts of
   `kernaid-provider-key configure`, then explicitly select OpenAI in Desk. The
   companion is a separate, platform-matched workflow artifact. Current source
   builds it from a package outside the Tauri crate, and the Desktop workflow
@@ -110,6 +110,13 @@ The CI workflows are configured to produce engineering-preview desktop installer
   the complete OS corpus to a provider-neutral proposal before the bounded
   60-second HTTPS request; raw collector content is never sent. Offline rules
   remain the startup/default provider and require no account or network.
+  Separately, Agent Gateway now exports bounded one-shot Anthropic Messages
+  and Gemini Interactions adapters. They send the same provider-neutral,
+  evidence-bound diagnosis projection, request strict JSON, expose no tools or
+  broker access, reject redirects and foreign evidence IDs, and obtain API
+  keys only from a runtime secret supplier. They are library implementations,
+  not yet wired into the shipping Desk/Rescue selector or qualified against
+  live vendor accounts.
 - **Do not use on customer data as a repair tool yet:** the current workflow diagnoses and stages an R0 no-write plan. It deliberately cannot execute real repairs.
 
 Qualified Rescue candidates pass three separate QEMU gates under both legacy
@@ -127,10 +134,28 @@ current workflow and downloadable-artifact status is tracked in
 has produced a publishable ISO.
 
 The private repair candidate has a separate, narrower workflow. Source now
-contains four off-default actions, but an implementation is not qualification:
-no current-source repair ISO is promoted, and the full rollback, fault,
-restart, power-loss, physical USB, hardware, firmware, Secure Boot and
-customer-data gates remain open.
+contains four off-default actions. Its consolidated exact-image harness now
+reuses one provisioned Rescue/Vault base across isolated scenario copies: the
+existing `fstab` apply/failure/recovery matrix, `crypttab` apply plus fresh
+explicit rollback, ext4 preen plus a clean read-only postcheck, and exact
+resolver-link restoration. This is implemented qualification logic, not a
+successful remote workflow or a promoted ISO. Power-loss, physical USB,
+hardware, firmware, Secure Boot and customer-data gates remain open.
+
+Fleet Resident workflow source also contains native staged package-lifecycle
+gates. Linux inspects and runs the exact built `.deb` once in an isolated root;
+Windows registers the packaged executable as an on-demand `LocalService`,
+proves it remains stopped, exercises the fail-closed one-shot path and
+uninstalls it; the native macOS matrix leg verifies disabled LaunchAgent
+settings, exercises the same no-anchor failure and cleans up. These checks use
+no enrollment identity or signing key. No post-change green workflow is cited
+yet, and they do not replace signing, real enrollment, native secret-store or
+physical endpoint qualification.
+
+Signed Fleet policy now recognizes the closed provider-mode catalog
+`offline`, `openai_api`, `openai_compatible`, `anthropic_api`, `gemini_api` and
+`enterprise`. Policy can only remove modes from the device's local allowlist;
+it cannot enable an unsupported adapter or grant broker authority.
 
 ## Trust boundaries
 
@@ -140,11 +165,13 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
 
 ## Current limitations
 
-- Resident mode has one bounded diagnosis-only OpenAI Responses adapter plus
-  deterministic offline rules. Rescue includes feature-gated persistent-vault,
-  signed-report, executor and loopback UI-server relay plumbing; an exact image is virtually
-  qualified only after the full Rescue workflow passes, including both
-  privileged BIOS and UEFI lifecycle jobs. The
+- Shipping Resident Desk still has one bounded diagnosis-only OpenAI Responses
+  integration plus deterministic offline rules. The tool-free Anthropic and
+  Gemini adapters exist in Agent Gateway source but are not yet wired into a
+  product selector or remotely qualified. Rescue includes feature-gated
+  persistent-vault, signed-report, executor and loopback UI-server relay
+  plumbing; an exact image is virtually qualified only after the full Rescue
+  workflow passes, including both privileged BIOS and UEFI lifecycle jobs. The
   v2 writer can provision that vault only for an exact catalog-authorized image
   on factory-new controlled-lab media; revision 8 authorizes the exact current
   internally qualified candidate.

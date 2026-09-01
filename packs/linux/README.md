@@ -72,20 +72,39 @@ mount, revalidates target identity around observation, binds three canonical
 evidence hashes and stages a single-use typed Core approval. Raw UUID, mapper,
 key and configuration data remain out of protocol, logs and `Debug`.
 
-This crypttab tranche deliberately has no execution method, repaird route or
-UI. It must reuse the fstab candidate's distinct-Vault reservation, single-use
-write lease, atomic regular-file replacement, automatic restore, explicit
-rollback and reboot reconciliation before it can be packaged. The manifest is
-a required contract, not evidence that those gates already exist.
+The private feature-gated candidate now reuses the `fstab` transaction boundary:
+a retained target and physically distinct authenticated Vault, durable backup
+and pending state, typed single-use approval, root write lease, atomic
+regular-file replacement, verification with automatic restore, the fresh
+explicit rollback action `linux.crypttab.disable-missing-source.v1`, and restart
+reconciliation through the closed repair daemon and UI route. It remains
+off-default, absent from stable builds, unpromoted and unsupported; implemented
+source is not exact-image or physical qualification.
 
-The candidate can propose commenting only one active, mandatory UUID entry
-that is absent from a caller-supplied observed UUID set and mounts below
+The `fstab` candidate can propose commenting only one active, mandatory UUID
+entry that is absent from a caller-supplied observed UUID set and mounts below
 `/mnt/`, `/media/`, or `/srv/` on `ext4`. It fails closed for malformed input,
 multiple targets, critical mount trees (`/`, boot, system directories, home,
 or swap), other mount locations or filesystem types, bind mounts, and network
 filesystems. Its strict JSON input binds the version-2 `KA-LNX-P0-003` finding
 and exact before, observed UUID-set, and proposed-after SHA-256 fingerprints;
 it accepts no path, replacement bytes, or command.
+
+`linux.ext4.fsck-preen-with-undo.v1` is the separate off-default R3 ext4
+candidate. It admits only the explicitly selected, unmounted ext4 target after
+a bounded read-only `e2fsck -f -n` proves that preen can attempt the repair. It
+reserves evidence in the distinct Vault, runs the fixed `e2fsck -f -p -z`
+operation, and requires a clean read-only postcheck. A controlled same-boot
+failure can use the generated undo data; ambiguous restart state stops for
+manual reconciliation. It does not claim a full-filesystem backup, guaranteed
+post-commit rollback, or physical hardware repair.
+
+The current exact-image harness reuses one provisioned Rescue/Vault/target base
+through isolated sparse copies. It covers the existing `fstab`
+apply/failure/recovery matrix, `crypttab` apply and fresh explicit rollback,
+ext4 preen and clean read-only postcheck, and resolver-link apply with exact
+relative-symlink restoration. This is implemented harness coverage only: no
+green remote run or physical qualification is claimed here.
 
 The pure preview emits all three contract bindings plus `diffSha256`.
 `beforeSha256` and `afterSha256` hash the exact input and proposed byte streams.

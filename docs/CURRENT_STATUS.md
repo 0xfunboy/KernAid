@@ -45,12 +45,12 @@ production promotion of repair packs remain open milestones.
 | Rescue UI | Branded Tauri/WebKitGTK shell in the Debian live image, with explicit runtime/readiness gates |
 | Target handling | Candidate discovery and explicit target selection; target filesystems remain read-only |
 | Evidence | Normalized Linux, Windows and macOS diagnosis inputs, bounded hardware/storage/filesystem/boot observations and provenance framing |
-| Diagnosis | Deterministic offline rules plus a bounded optional Resident OpenAI reasoning adapter |
+| Diagnosis | Deterministic offline rules plus the bounded optional Resident OpenAI integration. Agent Gateway also exports one-shot Anthropic Messages and Gemini Interactions adapters with strict structured output and no tools or broker access; those adapters are not wired into the shipping Desk/Rescue selector or qualified against live vendor accounts. |
 | Planning | Typed R0 no-write plan validated by Core |
 | Reporting | Resident Desk exposes authoritative machine-readable JSON: a signed envelope when secure audit is active, otherwise an explicitly unsigned hashed JSON artifact. It also derives an always-unsigned human-readable Markdown copy that does not replace the JSON. Rescue can persist the exact signed JSON report plus audit sequence in the Vault and export it through the native TTY companion |
 | Rescue credential boundary | Isolated credential vault and fail-closed Codex login/status/logout bridge; it does not run prompts or diagnoses |
 | Rescue provider plumbing | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified |
-| Virtual testing | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot, two-boot USB/Vault coverage and one consolidated repair batch that reuses a provisioned base across isolated scenario copies |
+| Exact-image harness | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/Vault coverage. Current source extends one shared-base repair batch across isolated copies for the `fstab` apply/failure/recovery matrix, `crypttab` apply and fresh explicit rollback, ext4 preen and clean read-only postcheck, and exact resolver-link restoration. The extended batch has no recorded green remote run yet. |
 | Repair experiment | Linux-only feature-gated Desk lab for one typed R2 repair and separately approved rollback on an internal temporary fixture. It now traverses the standard `SessionDriver`, Agent Gateway, explicit Core transaction states and typed broker; it remains absent from normal/Rescue builds and disconnected from production targets |
 | Feature-gated Rescue repair candidate | Off-default `fstab`, `crypttab`, ext4 and resolver-link recovery actions traverse the closed UI/Core/broker boundary. They bind a descriptor-retained target, reserve evidence on a distinct authenticated Vault, require typed single-use approval, verify the result and expose rollback or truthful manual reconciliation. The stable image excludes every repair surface. |
 | `fstab` recovery | `linux.fstab.disable-missing-uuid.v1` atomically disables only a freshly proven missing, non-critical ext4 UUID entry and supports exact restore, automatic restore and restart reconciliation. |
@@ -58,10 +58,12 @@ production promotion of repair packs remain open milestones.
 | ext4 recovery | `linux.ext4.fsck-preen-with-undo.v1` is an R3, unmounted-target action using bounded `e2fsck -p -f -z`, read-only verification and same-boot `e2undo`; it explicitly stops for manual reconciliation when exact recovery cannot be proved. |
 | Resolver-link recovery | `linux.network.restore-resolver-link.v1` restores only the fixed resolver symlink after proving exactly one supported resolver, preserves the exact missing/link pre-state in the Vault and never starts or restarts a service. |
 | Fleet control plane | Live internal schema v12: signed enrollment/inventory/audit/policy/entitlement/update delivery, secure browser sessions, RBAC, typed Linux, Windows and macOS work orders, incident cases and service receipts. Offline Ed25519 commercial licensing is active for the internal tenant; expiry, revocation, seat limits and clock rollback fail closed for paid operations. |
+| Fleet provider policy | Signed policy uses the closed modes `offline`, `openai_api`, `openai_compatible`, `anthropic_api`, `gemini_api` and `enterprise`. A mode is usable only when both local capability and signed policy allow it; policy cannot create an unsupported adapter or broker authority. |
 | Fleet backup | The live SQLite service has a scheduled, signed three-file backup bundle. The online copy is converted from WAL mode into one standalone database before its canonical manifest is signed; offline verify/restore reject tampering, wrong keys, sidecars, symlinks and overwrite. |
 | Linux Fleet Resident | A disabled-by-default amd64 `.deb` packages signed sync, the three closed Linux R0 diagnostic work orders, signed update staging and the UEFI/systemd-boot A/B activator. Installation does not enroll, enable, change boot state or reboot. |
 | Windows Fleet Resident | A separate off-default `LocalService` worker admits only `windows.p0.diagnose.v1@1`, retains digest-only idempotent state and exposes an explicitly unsigned deployment-bundle workflow. It installs on demand and never auto-starts. |
 | macOS Fleet Resident | A separate off-default LaunchAgent worker admits only `macos.p0.diagnose.v1@1`, reuses the bounded native Desk collector and retains digest-only idempotent state. Its Intel and Apple-silicon workflow bundles remain explicitly unsigned and unnotarized. |
+| Native Resident package lifecycle | Workflow source stages the exact Linux `.deb`, Windows ZIP and native-architecture macOS bundle, verifies the fixed claim/result files and disabled startup, exercises one fail-closed run with intentionally absent trust anchors, and cleans up. Windows additionally proves an on-demand stopped `LocalService`; macOS proves no LaunchAgent is loaded. These no-identity/no-key checks have no post-change green remote run yet and do not qualify signing, real enrollment, native secret storage or physical endpoints. |
 | Rescue Fleet adapter | The private candidate can display an exact Fleet `fstab` repair intent, but execution still requires a fresh local approval bound to device, lease, action, plan, target and evidence before the existing Core/Broker/Vault path is reached. Fleet cannot execute it remotely. |
 | Signed A/B activation | The off-default Linux activator admits only a signed, already staged inactive slot on locally provisioned UEFI/systemd-boot A/B systems. It persists before `bootctl`, uses one-shot boot, promotes or records fallback, retains offline rollback and never repartitions or reboots. BIOS/GRUB fails closed. |
 | Windows Media Creator | The native wizard consumes one exact Ed25519-signed release bundle, lists only qualified removable whole disks, requires exact erase confirmation, streams the XZ image and performs full readback SHA-256. Its workflow output remains an explicitly unsigned EXE/ZIP until Authenticode is applied externally. |
@@ -117,9 +119,12 @@ treated as a newer release.
 - Desktop installers are unsigned engineering previews.
 - The Linux Resident `.deb`, Windows Resident ZIP, macOS Resident bundles and
   Windows Media Creator ZIP are engineering packaging paths, not released
-  customer installers. Linux repository/package signing, Windows
-  Authenticode, macOS Developer ID signing/notarization, native installation
-  and physical endpoint qualification remain open.
+  customer installers. Workflow source now stages the exact Resident packages,
+  proves disabled startup, performs a deliberately no-anchor fail-closed run
+  and cleans up, but no post-change green remote run is claimed. Real identity,
+  enrollment, native secret stores, Linux repository/package signing, Windows
+  Authenticode, macOS Developer ID signing/notarization and physical endpoint
+  qualification remain open.
 - The Linux A/B activator requires a separately provisioned and qualified pair
   of bootable slots and UKIs. Its source implementation is not evidence that a
   customer device can be safely updated or rolled back.
@@ -136,6 +141,10 @@ treated as a newer release.
   not prove signer identity.
 - Rescue provider login with a real account, live TLS and physical encrypted
   persistence are incomplete release gates.
+- Anthropic and Gemini diagnosis adapters and their signed Fleet policy modes
+  are implemented in source, but they have no shipping product selector,
+  provisioned vendor credentials or live-API qualification. They remain
+  tool-free diagnosis adapters and grant no repair authority.
 - The signed Rescue report HTTP relay remains internal loopback plumbing, not a
   public API. Its virtual shipping-image gate has passed, but physical USB and
   recovery behavior are not yet qualified.
@@ -229,9 +238,14 @@ Current source contains four independent off-default actions: `fstab`,
 `crypttab`, ext4 preen/undo and resolver-link restoration. It also contains the
 local Rescue adapter for a Fleet-issued `fstab` intent. None is present in the
 stable image, and no current-source repair image has passed and been promoted
-through the full exact-image matrix. The table below remains historical
-evidence for the last separately reviewed image, not the status of current
-source.
+through the full exact-image matrix. The current harness reuses one provisioned
+Rescue/Vault/target base through isolated sparse copies and covers the existing
+`fstab` apply/failure/recovery matrix, `crypttab` apply plus fresh explicit
+rollback, ext4 preen plus clean read-only verification, and resolver apply plus
+exact symlink restoration. That source-level extension was added after the
+historical run below; no green remote run or promoted repair image proves it.
+The table therefore remains evidence for the last separately reviewed image,
+not the status of current source.
 
 | Field | Exact value |
 | --- | --- |
@@ -274,12 +288,14 @@ complete GUI qualification remain open.
 1. Run one integrated Rescue matrix containing the tty1 first-boot correction;
    promote nothing unless build, boot, two-boot, native prompt and both Vault
    lifecycle jobs pass on the same exact image.
-2. Run one integrated repair matrix for the current four-action source,
-   including apply, explicit/automatic rollback, injected failure and restart
-   reconciliation on disposable targets.
-3. Qualify installation, service identity, enrollment and the closed R0 work
-   order lifecycle for the privately published Linux and Windows Residents;
-   qualify the Media Creator erase/write/readback flow on disposable USB.
+2. Run the current shared-base exact-image repair batch and retain one green
+   remote run before treating its four scenarios as virtually qualified; then
+   keep destructive power-loss and physical recovery as separate gates.
+3. Obtain a green post-change workflow for the staged native Resident lifecycle,
+   then qualify real service identity, enrollment, native secret stores and the
+   closed R0 work-order lifecycle on physical Linux, Windows and macOS endpoints;
+   qualify the Media Creator erase/write/readback flow separately on disposable
+   USB.
 4. Boot the resulting exact diagnostic image from physical USB on a small
    hardware matrix using the [physical USB qualification
    runbook](runbooks/physical-usb-qualification.md), and record firmware,
