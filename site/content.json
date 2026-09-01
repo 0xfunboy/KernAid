@@ -1,5 +1,5 @@
 {
-  "schema": "dev.kernaid.site-content.v3",
+  "schema": "dev.kernaid.site-content.v4",
   "release": {
     "name": "KernAid Rescue AMD64",
     "channel": "Internal 0.1.0-internal.6 · virtual-qualified · diagnosis-only · physical-test candidate",
@@ -48,5 +48,99 @@
     "checksumName": "KernAid-Rescue-amd64-repair-candidate.iso.sha256",
     "qualification": "Il run 33306646523 ha superato avvio e apply QEMU sia BIOS sia UEFI, ma è fallito nel gate di rollback UEFI post-commit. Il risultato non qualifica il flusso repair, non appartiene al catalogo trusted e non autorizza la promozione nel sito o nel Release Channel. La release stabile 0.1.0-internal.5 resta esclusivamente diagnosis-only.",
     "warning": "NON DISPONIBILE NEL PRODOTTO: CANDIDATA FALLITA, NON PROMOSSA E NON QUALIFICATA. Il publish ISO formale è stato saltato; un artefatto forense temporaneo di Actions ha conservato ISO e checksum soltanto per l'analisi CI e non è esposto dal sito. Non usare repair su hardware o dati reali; USB fisica, firmware, Secure Boot, interruzioni e filesystem cliente restano non qualificati."
+  },
+  "software": {
+    "windowsMediaCreator": {
+      "available": false,
+      "name": "KernAid Media Creator for Windows",
+      "audience": "Retail media preparation",
+      "platform": "Windows 10/11 x86-64",
+      "packageFormat": "ZIP bundle",
+      "channel": "Internal engineering · awaiting reviewed artifact",
+      "sourceCommit": null,
+      "workflowRunId": null,
+      "artifactVersion": null,
+      "workflowUrl": null,
+      "downloadName": null,
+      "checksumName": null,
+      "bytes": null,
+      "sha256": null,
+      "qualification": "Non disponibile: commit sorgente, workflow run, dimensione e SHA-256 dell'esatto bundle non sono ancora stati inseriti nel catalogo revisionato.",
+      "warning": "NON PUBBLICATO. La futura build interna non dovrà essere interpretata come software Windows firmato o come Media Creator qualificato su hardware fisico senza le relative evidenze.",
+      "signature": {
+        "status": "not-assessed",
+        "statement": "Nessun artefatto collegato. Trattare una futura build come non firmata finché il catalogo non registra evidenza Authenticode verificabile.",
+        "evidenceUrl": null
+      }
+    },
+    "linuxFleetResident": {
+      "available": false,
+      "name": "KernAid Fleet Resident for Linux",
+      "audience": "Enterprise managed endpoints",
+      "platform": "Debian/Ubuntu x86-64",
+      "packageFormat": "DEB package",
+      "channel": "Internal engineering · awaiting reviewed artifact",
+      "sourceCommit": null,
+      "workflowRunId": null,
+      "artifactVersion": null,
+      "workflowUrl": null,
+      "downloadName": null,
+      "checksumName": null,
+      "bytes": null,
+      "sha256": null,
+      "qualification": "Non disponibile: il pacchetto installabile esatto non ha ancora provenance, dimensione e SHA-256 approvati per la distribuzione privata.",
+      "warning": "NON PUBBLICATO. Un checksum verifica l'integrità del file ma non costituisce una firma del publisher né qualifica installazione, upgrade o servizio residente su endpoint cliente.",
+      "signature": {
+        "status": "not-assessed",
+        "statement": "Nessun pacchetto collegato; stato della firma non valutato.",
+        "evidenceUrl": null
+      }
+    },
+    "windowsFleetResident": {
+      "available": false,
+      "name": "KernAid Fleet Resident for Windows",
+      "audience": "Enterprise managed endpoints",
+      "platform": "Windows x86-64",
+      "packageFormat": "Deployment ZIP bundle",
+      "channel": "Internal engineering · awaiting reviewed artifact",
+      "sourceCommit": null,
+      "workflowRunId": null,
+      "artifactVersion": null,
+      "workflowUrl": null,
+      "downloadName": null,
+      "checksumName": null,
+      "bytes": null,
+      "sha256": null,
+      "qualification": "Non disponibile: nessun bundle Windows esatto è stato ancora associato a un workflow run e a un digest revisionati.",
+      "warning": "NON PUBBLICATO. Non distribuire un futuro bundle su endpoint cliente finché packaging, installazione del servizio e stato Authenticode non sono dichiarati con precisione.",
+      "signature": {
+        "status": "not-assessed",
+        "statement": "Nessun artefatto collegato. Trattare una futura build come non firmata finché il catalogo non registra evidenza Authenticode verificabile.",
+        "evidenceUrl": null
+      }
+    },
+    "macosFleetResident": {
+      "available": false,
+      "name": "KernAid Fleet Resident for macOS",
+      "audience": "Enterprise managed endpoints",
+      "platform": "macOS",
+      "packageFormat": "Distribution package",
+      "channel": "Reserved product slot · no artifact",
+      "sourceCommit": null,
+      "workflowRunId": null,
+      "artifactVersion": null,
+      "workflowUrl": null,
+      "downloadName": null,
+      "checksumName": null,
+      "bytes": null,
+      "sha256": null,
+      "qualification": "Spazio riservato: non esiste ancora un artefatto macOS distribuibile e nessuna disponibilità è dichiarata.",
+      "warning": "NON DISPONIBILE. La card non rappresenta una preview scaricabile; pubblicazione vietata senza artefatto esatto, provenance, firma Developer ID e stato di notarizzazione verificati.",
+      "signature": {
+        "status": "not-assessed",
+        "statement": "Firma Developer ID e notarizzazione non valutate perché non esiste un artefatto collegato.",
+        "evidenceUrl": null
+      }
+    }
   }
 }

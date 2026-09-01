@@ -32,6 +32,14 @@ authorize it.
 | `/private/downloads/diagnostic-candidate-retail-checksum` | Authenticated | Optional SHA-256 sidecar for that retail image |
 | `/private/downloads/repair-candidate` | Authenticated | Range-capable, separately gated experimental repair-candidate ISO |
 | `/private/downloads/repair-candidate-checksum` | Authenticated | SHA-256 sidecar generated for the repair candidate |
+| `/private/downloads/windows-media-creator` | Authenticated | Optional range-capable Windows Media Creator ZIP bundle |
+| `/private/downloads/windows-media-creator-checksum` | Authenticated | SHA-256 sidecar generated for the Media Creator bundle |
+| `/private/downloads/linux-fleet-resident` | Authenticated | Optional range-capable Linux Fleet Resident DEB package |
+| `/private/downloads/linux-fleet-resident-checksum` | Authenticated | SHA-256 sidecar generated for the Linux Resident package |
+| `/private/downloads/windows-fleet-resident` | Authenticated | Optional range-capable Windows Fleet Resident deployment bundle |
+| `/private/downloads/windows-fleet-resident-checksum` | Authenticated | SHA-256 sidecar generated for the Windows Resident bundle |
+| `/private/downloads/macos-fleet-resident` | Authenticated | Reserved, fail-closed macOS Resident package route |
+| `/private/downloads/macos-fleet-resident-checksum` | Authenticated | Reserved, fail-closed macOS Resident checksum route |
 | `/private/logout` | Authenticated | Session revocation |
 
 Successful login creates a random, in-memory session with a 12-hour lifetime.
@@ -60,6 +68,14 @@ dependencies.
 | `KAID_DIAGNOSTIC_CANDIDATE_RETAIL_SHA256_PATH` | No | `${KAID_DIAGNOSTIC_CANDIDATE_RETAIL_PATH}.sha256` |
 | `KAID_REPAIR_CANDIDATE_PATH` | No; required only to expose the repair candidate | No default |
 | `KAID_REPAIR_CANDIDATE_SHA256_PATH` | No | `${KAID_REPAIR_CANDIDATE_PATH}.sha256` |
+| `KAID_WINDOWS_MEDIA_CREATOR_PATH` | No; required only after the exact bundle is enabled in `content.json` | No default |
+| `KAID_WINDOWS_MEDIA_CREATOR_SHA256_PATH` | No | `${KAID_WINDOWS_MEDIA_CREATOR_PATH}.sha256` |
+| `KAID_LINUX_FLEET_RESIDENT_PATH` | No; required only after the exact DEB is enabled in `content.json` | No default |
+| `KAID_LINUX_FLEET_RESIDENT_SHA256_PATH` | No | `${KAID_LINUX_FLEET_RESIDENT_PATH}.sha256` |
+| `KAID_WINDOWS_FLEET_RESIDENT_PATH` | No; required only after the exact bundle is enabled in `content.json` | No default |
+| `KAID_WINDOWS_FLEET_RESIDENT_SHA256_PATH` | No | `${KAID_WINDOWS_FLEET_RESIDENT_PATH}.sha256` |
+| `KAID_MACOS_FLEET_RESIDENT_PATH` | No; reserved until an exact macOS package is reviewed | No default |
+| `KAID_MACOS_FLEET_RESIDENT_SHA256_PATH` | No | `${KAID_MACOS_FLEET_RESIDENT_PATH}.sha256` |
 
 The authentication file must contain one non-empty password. Keep it and any
 Cloudflare tunnel credentials outside the repository with owner-only
@@ -75,6 +91,17 @@ the served artifact. A missing path or mismatch leaves only that artifact
 unavailable. Candidate environment variables are optional, so omitting them
 does not affect the stable internal.6 downloads. Operators and users must still
 verify each downloaded file using its sidecar.
+
+Software downloads use the same pinned-file, owner-only, range-capable path.
+They have an additional catalog gate: an environment variable cannot expose a
+package while its `software.*.available` flag is false. Enabling one requires a
+full 40-character source commit, the exact GitHub Actions run URL and ID,
+artifact version, safe presentation filenames, byte size, lowercase SHA-256,
+qualification text, warning text and an explicit `unsigned` or `signed` state.
+A signed state additionally requires an HTTPS evidence URL. Until all fields
+are reviewed, artifact fields remain JSON `null` and the route returns `404`.
+If the metadata is enabled but the configured file, permissions, sidecar, size
+or digest is wrong, the route returns `503`.
 
 Keep the private artifact directory owner-only (`0700`) and the ISO, checksum
 and metadata files owner-readable only (`0600`). Web authentication is not a
@@ -95,6 +122,12 @@ candidate changes, update together:
    its failed gate and exact passing coverage, without changing the stable paths;
 8. repair-candidate metadata and files separately, without changing the stable
    release paths or promoting the candidate.
+9. each software package independently: change `available` only in the same
+   review that records its exact commit, workflow run, version, filenames,
+   bytes, SHA-256, qualification boundary and signature state;
+10. publisher-signature evidence separately from the SHA-256 sidecar. Never
+    describe an unsigned Windows build as signed, or a macOS package as
+    notarized, solely because its workflow and checksum passed.
 
 `content.json` and all verified artifact snapshots are loaded once at process
 start, so restart the site process after changing release metadata or a
@@ -152,6 +185,9 @@ KAID_RETAIL_PATH=/path/to/KernAid-Rescue-amd64-retail.img.xz \
 KAID_ISO_PATH=/path/to/KernAid-Rescue-amd64.iso \
 KAID_DIAGNOSTIC_CANDIDATE_ISO_PATH=/path/to/KernAid-Rescue-amd64-diagnostic-candidate.iso \
 KAID_REPAIR_CANDIDATE_PATH=/path/to/KernAid-Rescue-amd64-repair-candidate.iso \
+KAID_WINDOWS_MEDIA_CREATOR_PATH=/path/to/KernAid-Media-Creator-windows-x86_64.zip \
+KAID_LINUX_FLEET_RESIDENT_PATH=/path/to/kernaid-fleet-resident_amd64.deb \
+KAID_WINDOWS_FLEET_RESIDENT_PATH=/path/to/KernAid-Fleet-Resident-windows-x86_64.zip \
 node site/server.mjs
 ```
 
@@ -173,6 +209,20 @@ GET  /private/downloads/diagnostic-candidate-retail Range 0-0
 GET  /private/downloads/repair-candidate Range 0-0
                                               404 when disabled; 503 if enabled but invalid;
                                               206, one byte when enabled and exact
+GET  /private/downloads/windows-media-creator Range 0-0
+                                              404 while catalog-disabled;
+                                              503 if enabled but invalid;
+                                              206, one byte when enabled and exact
+GET  /private/downloads/linux-fleet-resident Range 0-0
+                                              404 while catalog-disabled;
+                                              503 if enabled but invalid;
+                                              206, one byte when enabled and exact
+GET  /private/downloads/windows-fleet-resident Range 0-0
+                                              404 while catalog-disabled;
+                                              503 if enabled but invalid;
+                                              206, one byte when enabled and exact
+GET  /private/downloads/macos-fleet-resident Range 0-0
+                                              404 until a reviewed artifact exists
 POST /private/logout                     303 + expired session cookie
 ```
 

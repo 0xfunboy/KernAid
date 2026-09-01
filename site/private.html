@@ -193,6 +193,23 @@
       </div>
     </section>
 
+    <section class="software-catalog" aria-labelledby="software-catalog-title">
+      <div class="software-catalog-heading">
+        <div>
+          <p class="eyebrow">Software distribution</p>
+          <h2 id="software-catalog-title">Client e strumenti installabili.</h2>
+        </div>
+        <p>Ogni slot è indipendente e resta chiuso finché file, provenance, dimensione e SHA-256 non coincidono con il catalogo revisionato. “Disponibile” non significa automaticamente firmato o qualificato.</p>
+      </div>
+      <div class="software-grid">
+        {{softwareCards}}
+      </div>
+      <div class="catalog-boundary" role="note">
+        <strong>Regola di pubblicazione</strong>
+        <p>Il checksum protegge l'integrità del download; la firma del publisher e la qualifica della piattaforma sono evidenze separate. Gli slot privi di artefatto esatto rimangono visibili come roadmap, senza link attivi.</p>
+      </div>
+    </section>
+
     <section class="verify-card" aria-labelledby="verify-title">
       <div>
         <p class="card-kicker">Integrità</p>

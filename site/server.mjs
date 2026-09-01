@@ -21,6 +21,44 @@ const diagnosticCandidateRetailPath = process.env.KAID_DIAGNOSTIC_CANDIDATE_RETA
 const diagnosticCandidateRetailSha256Path = process.env.KAID_DIAGNOSTIC_CANDIDATE_RETAIL_SHA256_PATH || (diagnosticCandidateRetailPath ? `${diagnosticCandidateRetailPath}.sha256` : "");
 const repairCandidatePath = process.env.KAID_REPAIR_CANDIDATE_PATH || "";
 const repairCandidateSha256Path = process.env.KAID_REPAIR_CANDIDATE_SHA256_PATH || (repairCandidatePath ? `${repairCandidatePath}.sha256` : "");
+const softwareArtifactDefinitions = Object.freeze({
+  windowsMediaCreator: Object.freeze({
+    route: "windows-media-creator",
+    label: "Windows Media Creator bundle",
+    filePath: process.env.KAID_WINDOWS_MEDIA_CREATOR_PATH || "",
+    checksumPath: process.env.KAID_WINDOWS_MEDIA_CREATOR_SHA256_PATH ||
+      (process.env.KAID_WINDOWS_MEDIA_CREATOR_PATH
+        ? `${process.env.KAID_WINDOWS_MEDIA_CREATOR_PATH}.sha256`
+        : ""),
+  }),
+  linuxFleetResident: Object.freeze({
+    route: "linux-fleet-resident",
+    label: "Linux Fleet Resident package",
+    filePath: process.env.KAID_LINUX_FLEET_RESIDENT_PATH || "",
+    checksumPath: process.env.KAID_LINUX_FLEET_RESIDENT_SHA256_PATH ||
+      (process.env.KAID_LINUX_FLEET_RESIDENT_PATH
+        ? `${process.env.KAID_LINUX_FLEET_RESIDENT_PATH}.sha256`
+        : ""),
+  }),
+  windowsFleetResident: Object.freeze({
+    route: "windows-fleet-resident",
+    label: "Windows Fleet Resident bundle",
+    filePath: process.env.KAID_WINDOWS_FLEET_RESIDENT_PATH || "",
+    checksumPath: process.env.KAID_WINDOWS_FLEET_RESIDENT_SHA256_PATH ||
+      (process.env.KAID_WINDOWS_FLEET_RESIDENT_PATH
+        ? `${process.env.KAID_WINDOWS_FLEET_RESIDENT_PATH}.sha256`
+        : ""),
+  }),
+  macosFleetResident: Object.freeze({
+    route: "macos-fleet-resident",
+    label: "macOS Fleet Resident package",
+    filePath: process.env.KAID_MACOS_FLEET_RESIDENT_PATH || "",
+    checksumPath: process.env.KAID_MACOS_FLEET_RESIDENT_SHA256_PATH ||
+      (process.env.KAID_MACOS_FLEET_RESIDENT_PATH
+        ? `${process.env.KAID_MACOS_FLEET_RESIDENT_PATH}.sha256`
+        : ""),
+  }),
+});
 const sessionLifetimeMs = 12 * 60 * 60 * 1000;
 const maxBodyBytes = 8 * 1024;
 const maxSessions = 256;
@@ -28,6 +66,22 @@ const maxFailedLoginKeys = 2048;
 
 const content = loadContent(path.join(root, "content.json"));
 const password = readSecret(authFile);
+const configuredSoftwareArtifacts = Object.freeze(Object.fromEntries(
+  Object.entries(softwareArtifactDefinitions).map(([key, definition]) => {
+    const reviewed = content.software[key];
+    return [
+      key,
+      loadArtifactSnapshot(
+        reviewed.available ? definition.filePath : "",
+        reviewed.available ? definition.checksumPath : "",
+        definition.label,
+        reviewed.available
+          ? { bytes: reviewed.bytes, sha256: reviewed.sha256 }
+          : null,
+      ),
+    ];
+  }),
+));
 const configuredArtifacts = Object.freeze({
   iso: loadArtifactSnapshot(isoPath, isoSha256Path, "ISO", {
     bytes: content.release.isoBytes,
@@ -74,6 +128,7 @@ const configuredArtifacts = Object.freeze({
         }
       : null,
   ),
+  ...configuredSoftwareArtifacts,
 });
 const publicFiles = new Map([
   ["/", loadPublicFile("index.html", "text/html; charset=utf-8")],
@@ -131,15 +186,162 @@ function assertOwnerOnlyDirectory(directoryPath) {
   }
 }
 
+function validateSoftwareContent(software) {
+  const expectedKeys = Object.keys(softwareArtifactDefinitions).sort();
+  if (!software || typeof software !== "object" || Array.isArray(software)) {
+    throw new Error("content.json software must be an object");
+  }
+  const actualKeys = Object.keys(software).sort();
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new Error(
+      `content.json software must contain exactly: ${expectedKeys.join(", ")}`,
+    );
+  }
+
+  const descriptiveFields = [
+    "name",
+    "audience",
+    "platform",
+    "packageFormat",
+    "channel",
+    "qualification",
+    "warning",
+  ];
+  const artifactFields = [
+    "sourceCommit",
+    "workflowRunId",
+    "artifactVersion",
+    "workflowUrl",
+    "downloadName",
+    "checksumName",
+    "bytes",
+    "sha256",
+  ];
+
+  for (const key of expectedKeys) {
+    const item = software[key];
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`content.json software.${key} must be an object`);
+    }
+    if (typeof item.available !== "boolean") {
+      throw new Error(`content.json software.${key}.available must be boolean`);
+    }
+    for (const field of descriptiveFields) {
+      if (typeof item[field] !== "string" || !item[field].trim()) {
+        throw new Error(`content.json software.${key}.${field} must be a non-empty string`);
+      }
+    }
+    if (!item.signature || typeof item.signature !== "object" || Array.isArray(item.signature)) {
+      throw new Error(`content.json software.${key}.signature must be an object`);
+    }
+    if (typeof item.signature.statement !== "string" || !item.signature.statement.trim()) {
+      throw new Error(
+        `content.json software.${key}.signature.statement must be a non-empty string`,
+      );
+    }
+
+    if (!item.available) {
+      for (const field of artifactFields) {
+        if (item[field] !== null) {
+          throw new Error(
+            `content.json software.${key}.${field} must be null while unavailable`,
+          );
+        }
+      }
+      if (item.signature.status !== "not-assessed" || item.signature.evidenceUrl !== null) {
+        throw new Error(
+          `content.json software.${key}.signature must be not-assessed without evidence while unavailable`,
+        );
+      }
+      continue;
+    }
+
+    if (!/^[a-f0-9]{40}$/.test(item.sourceCommit || "")) {
+      throw new Error(
+        `content.json software.${key}.sourceCommit must be a full lowercase Git commit`,
+      );
+    }
+    if (!Number.isSafeInteger(item.workflowRunId) || item.workflowRunId < 1) {
+      throw new Error(
+        `content.json software.${key}.workflowRunId must be a positive safe integer`,
+      );
+    }
+    if (typeof item.artifactVersion !== "string" || !item.artifactVersion.trim()) {
+      throw new Error(
+        `content.json software.${key}.artifactVersion must be a non-empty string`,
+      );
+    }
+    let workflowUrl;
+    try {
+      workflowUrl = new URL(item.workflowUrl);
+    } catch {
+      throw new Error(`content.json software.${key}.workflowUrl must be an absolute URL`);
+    }
+    if (
+      workflowUrl.protocol !== "https:" ||
+      !workflowUrl.pathname.endsWith(`/actions/runs/${item.workflowRunId}`)
+    ) {
+      throw new Error(
+        `content.json software.${key}.workflowUrl must be the HTTPS Actions URL for workflowRunId`,
+      );
+    }
+    for (const field of ["downloadName", "checksumName"]) {
+      if (typeof item[field] !== "string" || !/^[A-Za-z0-9._-]+$/.test(item[field])) {
+        throw new Error(`content.json software.${key}.${field} is not a safe filename`);
+      }
+    }
+    if (item.downloadName === item.checksumName) {
+      throw new Error(
+        `content.json software.${key} download and checksum names must differ`,
+      );
+    }
+    if (!Number.isSafeInteger(item.bytes) || item.bytes < 1) {
+      throw new Error(`content.json software.${key}.bytes must be a positive safe integer`);
+    }
+    if (!/^[a-f0-9]{64}$/.test(item.sha256 || "")) {
+      throw new Error(`content.json software.${key}.sha256 must be a lowercase SHA-256 digest`);
+    }
+    if (!new Set(["unsigned", "signed"]).has(item.signature.status)) {
+      throw new Error(
+        `content.json software.${key}.signature.status must be unsigned or signed when available`,
+      );
+    }
+    if (item.signature.status === "unsigned" && item.signature.evidenceUrl !== null) {
+      throw new Error(
+        `content.json software.${key}.signature.evidenceUrl must be null when unsigned`,
+      );
+    }
+    if (item.signature.status === "signed") {
+      let evidenceUrl;
+      try {
+        evidenceUrl = new URL(item.signature.evidenceUrl);
+      } catch {
+        throw new Error(
+          `content.json software.${key}.signature.evidenceUrl must be absolute when signed`,
+        );
+      }
+      if (evidenceUrl.protocol !== "https:") {
+        throw new Error(
+          `content.json software.${key}.signature.evidenceUrl must use HTTPS`,
+        );
+      }
+    }
+  }
+}
+
 function loadContent(filePath) {
   const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
   if (
-    parsed?.schema !== "dev.kernaid.site-content.v3" ||
+    parsed?.schema !== "dev.kernaid.site-content.v4" ||
     !parsed.release ||
     !parsed.diagnosticCandidate ||
-    !parsed.repairCandidate
+    !parsed.repairCandidate ||
+    !parsed.software
   ) {
-    throw new Error("content.json does not match dev.kernaid.site-content.v3");
+    throw new Error("content.json does not match dev.kernaid.site-content.v4");
   }
   for (const key of ["name", "channel", "sourceCommit", "artifactVersion", "workflowUrl", "downloadName", "checksumName", "retailDownloadName", "retailChecksumName", "qualification", "warning"]) {
     if (typeof parsed.release[key] !== "string" || !parsed.release[key].trim()) {
@@ -254,6 +456,7 @@ function loadContent(filePath) {
       "content.json repairCandidate.workflowRunId must be a positive safe integer",
     );
   }
+  validateSoftwareContent(parsed.software);
   return Object.freeze(parsed);
 }
 
@@ -526,6 +729,78 @@ function artifactView(snapshot) {
   }
 }
 
+function formatSoftwareBytes(bytes) {
+  if (bytes >= 1024 ** 3) return `${(bytes / (1024 ** 3)).toFixed(2)} GiB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / (1024 ** 2)).toFixed(2)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(2)} KiB`;
+  return `${bytes} B`;
+}
+
+function renderSoftwareCard(key) {
+  const item = content.software[key];
+  const definition = softwareArtifactDefinitions[key];
+  const snapshot = configuredSoftwareArtifacts[key];
+  const artifact = snapshot.artifact;
+  const ready = item.available && artifact !== null;
+  const state = ready
+    ? item.signature.status === "unsigned"
+      ? "Scaricabile · non firmato"
+      : "File scaricabile"
+    : item.available
+      ? "File non configurato"
+      : "Non disponibile";
+  const stateClass = ready
+    ? item.signature.status === "unsigned"
+      ? "status-warning"
+      : "status-ready"
+    : "status-unavailable";
+  const signatureLabel = item.signature.status === "signed"
+    ? "Firma verificata"
+    : item.signature.status === "unsigned"
+      ? "Artefatto non firmato"
+      : "Firma non valutata";
+  const signatureClass = item.signature.status === "signed"
+    ? "signature-signed"
+    : "signature-warning";
+  const workflowLink = item.workflowUrl
+    ? `<a href="${escapeHtml(item.workflowUrl)}" target="_blank" rel="noreferrer">Apri il workflow di provenienza ↗</a>`
+    : '<span class="software-muted">Workflow run non ancora assegnato</span>';
+  const signatureLink = item.signature.evidenceUrl
+    ? `<a href="${escapeHtml(item.signature.evidenceUrl)}" target="_blank" rel="noreferrer">Apri evidenza firma ↗</a>`
+    : "";
+  const actions = ready
+    ? `<a class="button primary" href="/private/downloads/${definition.route}">Scarica pacchetto</a><a class="button ghost" href="/private/downloads/${definition.route}-checksum">Scarica SHA-256</a>`
+    : '<span class="release-status status-unavailable"><i></i>Download bloccato dal catalogo</span>';
+  const verify = ready
+    ? `<code>sha256sum -c ${escapeHtml(item.checksumName)}</code>`
+    : "";
+
+  return `<article class="software-card" aria-labelledby="software-${escapeHtml(key)}-title">
+    <div class="software-card-heading">
+      <div>
+        <p class="card-kicker">${escapeHtml(item.audience)}</p>
+        <h3 id="software-${escapeHtml(key)}-title">${escapeHtml(item.name)}</h3>
+      </div>
+      <span class="release-status ${stateClass}"><i></i>${escapeHtml(state)}</span>
+    </div>
+    <p class="software-channel">${escapeHtml(item.channel)}</p>
+    <div class="software-platform"><span>${escapeHtml(item.platform)}</span><span>${escapeHtml(item.packageFormat)}</span></div>
+    <div class="software-warning" role="note"><strong>Confine di distribuzione</strong><p>${escapeHtml(item.warning)}</p></div>
+    <dl class="software-meta">
+      <div><dt>File</dt><dd><code>${escapeHtml(item.downloadName || "Non assegnato")}</code></dd></div>
+      <div><dt>Versione</dt><dd><code>${escapeHtml(item.artifactVersion || "Non assegnata")}</code></dd></div>
+      <div><dt>Commit sorgente</dt><dd><code>${escapeHtml(item.sourceCommit || "Non assegnato")}</code></dd></div>
+      <div><dt>Workflow run</dt><dd><code>${escapeHtml(item.workflowRunId || "Non assegnato")}</code></dd></div>
+      <div><dt>Dimensione</dt><dd>${artifact ? escapeHtml(formatSoftwareBytes(artifact.bytes)) : "Non disponibile"}</dd></div>
+      <div><dt>SHA-256</dt><dd><code class="full-hash">${artifact ? escapeHtml(artifact.hash) : "Non disponibile"}</code></dd></div>
+    </dl>
+    <div class="software-qualification"><strong>Qualifica dichiarata</strong><p>${escapeHtml(item.qualification)}</p>${workflowLink}</div>
+    <div class="software-signature ${signatureClass}"><strong>${escapeHtml(signatureLabel)}</strong><p>${escapeHtml(item.signature.statement)}</p>${signatureLink}</div>
+    <div class="release-actions">${actions}</div>
+    ${verify}
+  </article>`;
+}
+
 function renderPrivate() {
   const retail = artifactView(configuredArtifacts.retail);
   const iso = artifactView(configuredArtifacts.iso);
@@ -618,6 +893,9 @@ function renderPrivate() {
     size: escapeHtml(retail.size),
     sourceCommit: escapeHtml(release.sourceCommit),
     stateClass: retail.stateClass,
+    softwareCards: Object.keys(softwareArtifactDefinitions)
+      .map((key) => renderSoftwareCard(key))
+      .join(""),
     warning: escapeHtml(release.warning),
     workflowUrl: escapeHtml(release.workflowUrl),
   });
@@ -908,6 +1186,40 @@ async function handleRequest(req, res) {
       content.repairCandidate.downloadName,
       content.repairCandidate.checksumName,
     );
+    return;
+  }
+  for (const [key, definition] of Object.entries(softwareArtifactDefinitions)) {
+    const item = content.software[key];
+    const downloadPath = `/private/downloads/${definition.route}`;
+    const checksumPath = `${downloadPath}-checksum`;
+    if (url.pathname !== downloadPath && url.pathname !== checksumPath) continue;
+    if (!item.available) {
+      send(
+        req,
+        res,
+        404,
+        "Software non disponibile.\n",
+        { "Content-Type": "text/plain; charset=utf-8" },
+        { isPrivate: true },
+      );
+      return;
+    }
+    if (url.pathname === checksumPath) {
+      serveChecksum(
+        req,
+        res,
+        configuredSoftwareArtifacts[key],
+        item.downloadName,
+        item.checksumName,
+      );
+    } else {
+      serveArtifact(
+        req,
+        res,
+        configuredSoftwareArtifacts[key],
+        item.downloadName,
+      );
+    }
     return;
   }
   send(req, res, 404, "Non trovato.\n", { "Content-Type": "text/plain; charset=utf-8" }, { isPrivate: true });
