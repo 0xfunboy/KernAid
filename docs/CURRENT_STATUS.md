@@ -65,7 +65,7 @@ production promotion of repair packs remain open milestones.
 | Rescue Fleet adapter | The private candidate can display an exact Fleet `fstab` repair intent, but execution still requires a fresh local approval bound to device, lease, action, plan, target and evidence before the existing Core/Broker/Vault path is reached. Fleet cannot execute it remotely. |
 | Signed A/B activation | The off-default Linux activator admits only a signed, already staged inactive slot on locally provisioned UEFI/systemd-boot A/B systems. It persists before `bootctl`, uses one-shot boot, promotes or records fallback, retains offline rollback and never repartitions or reboots. BIOS/GRUB fails closed. |
 | Windows Media Creator | The native wizard consumes one exact Ed25519-signed release bundle, lists only qualified removable whole disks, requires exact erase confirmation, streams the XZ image and performs full readback SHA-256. Its workflow output remains an explicitly unsigned EXE/ZIP until Authenticode is applied externally. |
-| Private software catalog | The authenticated project site has independent fail-closed slots for Media Creator and Linux, Windows and macOS Residents. A route remains unavailable until exact provenance, file, size, checksum, qualification and signature state are all reviewed and configured; the current software slots are not published. |
+| Private software catalog | The authenticated project site now serves the reviewed Media Creator, Linux Resident and Windows Resident engineering artifacts from runs `33454416574`, `33454416246` and `33454416610`, with exact provenance, bytes, checksum, qualification and unsigned status. The macOS route remains fail-closed while its two architecture-specific unsigned/unnotarized outputs are consolidated. |
 | Rescue first boot | The promoted image provisions an all-zero p3 into the canonical LUKS2/ext4 Vault, seeds its identity and Codex home, closes it and verifies the locked profile; the exact flow passed two-boot BIOS/UEFI QEMU qualification |
 | Release channel | Canonical Release Channel v1, anti-rollback links, strict verification and immutable internal prerelease `0.1.0-internal.6` are active through sequence 6; this is not an automatic updater or signed production channel |
 
@@ -277,8 +277,9 @@ complete GUI qualification remain open.
 2. Run one integrated repair matrix for the current four-action source,
    including apply, explicit/automatic rollback, injected failure and restart
    reconciliation on disposable targets.
-3. Build and review the exact Media Creator, Linux Resident and Windows
-   Resident workflow artifacts before enabling their gated private-site slots.
+3. Qualify installation, service identity, enrollment and the closed R0 work
+   order lifecycle for the privately published Linux and Windows Residents;
+   qualify the Media Creator erase/write/readback flow on disposable USB.
 4. Boot the resulting exact diagnostic image from physical USB on a small
    hardware matrix using the [physical USB qualification
    runbook](runbooks/physical-usb-qualification.md), and record firmware,

@@ -163,9 +163,9 @@ owner-only and outside source control.
 
 The remaining RC work is:
 
-1. run and review the exact Linux `.deb` and unsigned Windows deployment-bundle
-   workflows, then qualify installation, service identity and work-order
-   lifecycle on their declared systems;
+1. qualify installation, service identity and work-order lifecycle for the
+   exact reviewed Linux `.deb` and unsigned Windows deployment bundle now
+   published in the authenticated project area;
 2. qualify the Linux UEFI/systemd-boot A/B activator on a disposable two-slot
    system and bind it to one exact signed release; BIOS/GRUB remains unsupported;
 3. qualify the local Rescue Fleet `fstab` adapter end to end. Fleet may deliver

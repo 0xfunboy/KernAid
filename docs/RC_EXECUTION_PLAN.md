@@ -56,8 +56,10 @@ Integrated in current source, but not automatically qualified or promoted:
   release bundle while its EXE/ZIP remains unsigned pending Authenticode;
 - live Fleet schema v12 with active offline commercial licensing and scheduled
   signed, WAL-safe, independently verified backup bundles; and
-- a gated private software catalog that publishes no slot without exact
-  provenance, digest, qualification and signature-state metadata.
+- a gated private software catalog that now publishes the reviewed Media
+  Creator, Linux Resident and Windows Resident engineering artifacts with
+  exact provenance, digest, qualification and unsigned-state metadata; the
+  dual-architecture macOS slot remains closed.
 
 The latest diagnostic candidate, Rescue run `33447510598`, passed the core
 build/boot/render/input/two-boot gates but failed all three Vault jobs at the
