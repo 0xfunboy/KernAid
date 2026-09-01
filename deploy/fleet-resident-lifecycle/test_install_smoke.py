@@ -57,6 +57,13 @@ class LifecycleSmokeStaticTests(unittest.TestCase):
                 value = json.loads(config.read_bytes())
                 self.assertEqual(value["endpoint"], "https://fleet.example.invalid/")
                 self.assertFalse((platform_root / "absent-public-anchors").exists())
+                if platform == "linux":
+                    self.assertNotIn("enrollmentTokenFile", value)
+                else:
+                    self.assertEqual(
+                        value["enrollmentTokenFile"],
+                        str(platform_root / "absent-enrollment-token"),
+                    )
 
     def test_platform_defaults_remain_off(self) -> None:
         linux_unit = (

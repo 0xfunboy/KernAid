@@ -151,7 +151,6 @@ def write_smoke_config(platform: str, root: Path) -> tuple[Path, Path]:
         "serviceReceiptAnchorFile": str(trust / "service.pub"),
         "entitlementAnchorFile": str(trust / "entitlement.pub"),
         "policyAnchorFile": str(trust / "policy.pub"),
-        "enrollmentTokenFile": str(root / "absent-enrollment-token"),
         "intervalSeconds": 60,
         "minimumBackoffSeconds": 2,
         "maximumBackoffSeconds": 30,
@@ -159,6 +158,8 @@ def write_smoke_config(platform: str, root: Path) -> tuple[Path, Path]:
         "requestTimeoutSeconds": 5,
         "leaseSeconds": 300,
     }
+    if platform in {"windows", "macos"}:
+        config["enrollmentTokenFile"] = str(root / "absent-enrollment-token")
     path = root / "smoke-config.json"
     path.write_bytes(
         json.dumps(config, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
