@@ -2,7 +2,7 @@
 
 KernAid is an evidence-first machine diagnosis and repair platform. This repository implements the Rescue, Desk and Enterprise vertical slices described in the [masterplan](docs/MASTERPLAN.md) under the active [seven-day RC execution plan](docs/RC_EXECUTION_PLAN.md). For the concise, date-stamped distinction between what works now and what remains unqualified, start with [Current status](docs/CURRENT_STATUS.md). For a compact map of the product, repository, build host and release flow, see the [Project map](docs/PROJECT_MAP.md). Fleet operators and integrators should use the [Enterprise engineering guide](docs/ENTERPRISE.md).
 
-The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and produce a hashed JSON report. Resident Desk exposes that machine-readable JSON as the authoritative session artifact: it is a signed envelope when secure audit is active and an explicitly unsigned JSON artifact otherwise. Desk also derives a human-readable Markdown copy, always labeled unsigned; it is for reading and does not replace the JSON artifact or prove authenticity. In Rescue, when the encrypted Vault is unlocked before Desk starts, the JSON report and its audit sequence are persisted as a signed envelope and can be exported later from the native TTY companion. The default/stable product has no production mutation handler. A separate private, feature-gated Rescue repair candidate remains unavailable through the product site and Release Channel, unqualified and unpromoted. Its last documented terminal run passed exact-image QEMU boot and apply under BIOS and UEFI for one narrowly bounded action, then failed the UEFI post-commit rollback gate; a later requalification run is evaluated independently and creates no support claim until its terminal evidence is reviewed. See [Current status](docs/CURRENT_STATUS.md). On Linux, a separate opt-in `fixture-repair-lab` Desk build sends one complete, explicitly approved repair and separately approved rollback through the standard SessionDriver, Agent Gateway, Core transaction states and typed broker against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
+The current Phase 0 engineering vertical slice is deliberately safe: start a session, collect a normalized read-only host snapshot, run deterministic offline diagnostic rules, validate an R0 plan through Core, and produce a hashed JSON report. Resident Desk exposes that machine-readable JSON as the authoritative session artifact: it is a signed envelope when secure audit is active and an explicitly unsigned JSON artifact otherwise. Desk also derives a human-readable Markdown copy, always labeled unsigned; it is for reading and does not replace the JSON artifact or prove authenticity. In Rescue, when the encrypted Vault is unlocked before Desk starts, the JSON report and its audit sequence are persisted as a signed envelope and can be exported later from the native TTY companion. The default/stable product has no production mutation handler. Current source contains separate private, feature-gated `fstab`, `crypttab`, ext4 and resolver-link candidates, but none is promoted or supported on customer data. See [Current status](docs/CURRENT_STATUS.md) for the exact latest workflow evidence. On Linux, a separate opt-in `fixture-repair-lab` Desk build sends one complete, explicitly approved repair and separately approved rollback through the standard SessionDriver, Agent Gateway, Core transaction states and typed broker against an internally created disposable fixture. It is absent from normal builds and Rescue and cannot select a host path, disk or production target.
 
 ## Quick start
 
@@ -83,14 +83,13 @@ The CI workflows are configured to produce engineering-preview desktop installer
   ISO passed persistence, retrieval and fixed-path signed-envelope export on
   that same artifact under virtual BIOS and UEFI. Physical USB behavior remains
   a separate qualification gate.
-  The separately gated repair candidate is private and unavailable through the
-  product site or Release Channel. The last documented terminal run,
-  `33306646523`, passed BIOS/UEFI boot and apply, then failed the UEFI
-  post-commit rollback gate at marker `repair-rollback-service-ready`; restart
-  reconciliation was therefore skipped. It does not replace this stable
-  diagnosis-only retail image, and rollback/restart are not qualified. Repair
-  requalification run `33334118587` is separate; this document makes no claim
-  about its outcome until the complete terminal evidence has been reviewed.
+  A newer diagnosis-only ISO from run `33447510598` is separately available in
+  the authenticated area for physical boot/UI investigation. Its core boot
+  gates passed, but all three Vault jobs failed at first-boot confirmation; the
+  tty1 correction in current source is not yet requalified. It does not replace
+  this stable image. The repair candidate remains private, unavailable and
+  unpromoted; current exact evidence is maintained in
+  [Current status](docs/CURRENT_STATUS.md).
 - **Windows, Linux or macOS that does boot:** use the matching unsigned artifact from immutable release `0.1.0-internal.6`, built by Desktop run `33330140025` attempt 1 from the same exact source as Rescue. All four platform jobs and their package-inspection gates passed. Install it and launch KernAid like a normal application; CI packaging is not physical installation or complete GUI qualification. The gate rejects Desk packages containing the separately distributed credential companion. Windows and macOS startup collect only a fast, derived target identity; the deeper P0 collection starts once when **Diagnostica** is selected. macOS queries only the current-user `launchd` table and safe-boot integer, and explicitly reports system `launchd`, software-update availability, system-event analysis, and login/background-item counts as unqualified instead of inventing results. The fixed commands do not request repairs, although native Windows tools such as DISM may still update their own operating-system logs. After diagnosis, retain the JSON as the authoritative machine-readable artifact; the additional Markdown download is an explicitly unsigned reading copy.
 - **Linux machine inventory:** Resident and Rescue use the same bounded Rust
   collector for CPU count/model, total RAM, firmware boot mode, selected public
@@ -127,18 +126,11 @@ current workflow and downloadable-artifact status is tracked in
 [Current status](docs/CURRENT_STATUS.md); do not infer that every `main` commit
 has produced a publishable ISO.
 
-The private repair candidate has a separate, narrower workflow. Its last
-documented terminal exact-source run passed ordinary BIOS/UEFI boot smoke and
-the single `linux.fstab.disable-missing-uuid.v1` apply path under both BIOS and UEFI on a
-disposable ext4 target with a distinct LUKS2/ext4 Vault. The workflow then
-failed the UEFI post-commit rollback service-readiness gate, so the formal
-candidate publish step was skipped and restart reconciliation did not run. A
-short-lived forensics artifact retained the ISO only for CI investigation. A
-later requalification run (`33334118587`) remains separate from the stable
-release and is not a qualification claim until its terminal evidence is
-reviewed. Rollback, fault, restart, power-loss, physical USB, hardware,
-firmware, Secure Boot and customer-data
-qualification remain open.
+The private repair candidate has a separate, narrower workflow. Source now
+contains four off-default actions, but an implementation is not qualification:
+no current-source repair ISO is promoted, and the full rollback, fault,
+restart, power-loss, physical USB, hardware, firmware, Secure Boot and
+customer-data gates remain open.
 
 ## Trust boundaries
 
