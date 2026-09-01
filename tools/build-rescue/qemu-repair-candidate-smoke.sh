@@ -20,15 +20,17 @@ readonly provisioned_target="${KERNAID_REPAIR_TARGET_BASE:-}"
 readonly tamper_helper="$repo_dir/tools/build-rescue/qemu-repair-vault-tamper.py"
 
 if [[ "$firmware" != bios && "$firmware" != uefi ]]; then
-  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile|failure-paths] [iso]" >&2
+  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile|crypttab-lifecycle|ext4-apply|resolver-link-apply|failure-paths|qualification-batch] [iso]" >&2
   exit 2
 fi
 if [[ "$scenario" != apply && "$scenario" != rollback \
   && "$scenario" != interrupt-reconcile && "$scenario" != failure-paths \
   && "$scenario" != stale-target && "$scenario" != cancel \
   && "$scenario" != backup-tamper && "$scenario" != repaird-termination \
-  && "$scenario" != auto-restore && "$scenario" != qualification-batch ]]; then
-  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile|failure-paths|qualification-batch] [iso]" >&2
+  && "$scenario" != auto-restore && "$scenario" != crypttab-lifecycle \
+  && "$scenario" != ext4-apply && "$scenario" != resolver-link-apply \
+  && "$scenario" != qualification-batch ]]; then
+  echo "Usage: $0 [bios|uefi] [apply|rollback|interrupt-reconcile|crypttab-lifecycle|ext4-apply|resolver-link-apply|failure-paths|qualification-batch] [iso]" >&2
   exit 2
 fi
 if [[ "$scenario" == qualification-batch && "$firmware" != uefi ]]; then
@@ -53,7 +55,9 @@ elif [[ "$scenario" == interrupt-reconcile || "$scenario" == backup-tamper ]]; t
 elif [[ "$scenario" == failure-paths ]]; then
   controller_timeout=1200
 elif [[ "$scenario" == stale-target || "$scenario" == cancel \
-  || "$scenario" == repaird-termination || "$scenario" == auto-restore ]]; then
+  || "$scenario" == repaird-termination || "$scenario" == auto-restore \
+  || "$scenario" == crypttab-lifecycle || "$scenario" == ext4-apply \
+  || "$scenario" == resolver-link-apply ]]; then
   # Reserve the full bounded repair shutdown window after the guest proof.
   controller_timeout=1200
 fi
@@ -84,6 +88,9 @@ required_commands=(
   debugfs dd mkfs.ext4 mktemp od python3 qemu-system-x86_64
   realpath sha256sum stat truncate unsquashfs xorriso
 )
+if [[ "$scenario" == ext4-apply ]]; then
+  required_commands+=(e2fsck)
+fi
 if [[ "$scenario" == failure-paths || "$scenario" == backup-tamper ]]; then
   required_commands+=(blockdev cryptsetup losetup sudo)
 fi
@@ -119,8 +126,12 @@ vault_key="$work_dir/vault-key"
 observed_fstab="$work_dir/observed-fstab"
 observed_sentinel="$work_dir/observed-sentinel"
 observed_fstab_stat="$work_dir/observed-fstab.stat"
+observed_crypttab="$work_dir/observed-crypttab"
+observed_crypttab_stat="$work_dir/observed-crypttab.stat"
+observed_resolver_stat="$work_dir/observed-resolver.stat"
 observed_etc_listing="$work_dir/observed-etc.list"
 expected_after="$work_dir/expected-after"
+expected_crypttab_after="$work_dir/expected-crypttab-after"
 controller_output="$work_dir/controller.out"
 controller_error="$work_dir/controller.err"
 qmp_socket="$work_dir/qmp.sock"
@@ -129,8 +140,9 @@ ovmf_vars_template=""
 
 mkdir -p -- \
   "$seed/etc" \
+  "$seed/etc/systemd/system/multi-user.target.wants" \
   "$seed/boot" \
-  "$seed/usr" \
+  "$seed/usr/lib/systemd/system" \
   "$seed/var/lib/dpkg" \
   "$seed/srv/archive"
 printf '%s\n' \
@@ -146,14 +158,39 @@ printf '%s\n' \
   'UUID=11111111-1111-4111-8111-111111111111 / ext4 defaults 0 1' \
   '# KernAid Rescue disabled missing UUID: UUID=deadbeef-dead-4eef-8ead-deadbeef0001 /srv/archive ext4 defaults 0 2' \
   >"$expected_after"
+printf '%s\n' \
+  'system UUID=11111111-1111-4111-8111-111111111111 none luks' \
+  'archive UUID=deadbeef-dead-4eef-8ead-deadbeef0002 none luks' \
+  >"$seed/etc/crypttab"
+printf '%s\n' \
+  'system UUID=11111111-1111-4111-8111-111111111111 none luks' \
+  '# KernAid Rescue disabled missing crypttab UUID: archive UUID=deadbeef-dead-4eef-8ead-deadbeef0002 none luks' \
+  >"$expected_crypttab_after"
+printf '%s\n' \
+  '[Unit]' \
+  'Description=KernAid resolver qualification fixture' \
+  >"$seed/usr/lib/systemd/system/systemd-resolved.service"
+ln -s -- /usr/lib/systemd/system/systemd-resolved.service \
+  "$seed/etc/systemd/system/multi-user.target.wants/systemd-resolved.service"
 printf '%s\n' KERNAID_REPAIR_TARGET_SENTINEL >"$seed/boot/vmlinuz-kernaid-repair"
 printf '%s\n' 'Package: kernaid-repair-fixture' >"$seed/var/lib/dpkg/status"
+printf '%s\n' KERNAID_EXT4_REPAIR_MARKER >"$seed/srv/archive/ext4-repair-marker"
 
 before_sha256="sha256:$(sha256sum "$seed/etc/fstab" | awk '{print $1}')"
 after_sha256="sha256:$(sha256sum "$expected_after" | awk '{print $1}')"
+crypttab_before_sha256="sha256:$(sha256sum "$seed/etc/crypttab" | awk '{print $1}')"
+crypttab_after_sha256="sha256:$(sha256sum "$expected_crypttab_after" | awk '{print $1}')"
+resolver_before_sha256="sha256:$(printf %s 'resolver-link-state:v1:missing' | sha256sum | awk '{print $1}')"
+resolver_after_sha256="sha256:$(printf %s 'resolver-link-state:v1:resolved-stub-relative' | sha256sum | awk '{print $1}')"
 [[ "$before_sha256" =~ ^sha256:[0-9a-f]{64}$ \
   && "$after_sha256" =~ ^sha256:[0-9a-f]{64}$ \
-  && "$before_sha256" != "$after_sha256" ]] || exit 1
+  && "$crypttab_before_sha256" =~ ^sha256:[0-9a-f]{64}$ \
+  && "$crypttab_after_sha256" =~ ^sha256:[0-9a-f]{64}$ \
+  && "$resolver_before_sha256" =~ ^sha256:[0-9a-f]{64}$ \
+  && "$resolver_after_sha256" =~ ^sha256:[0-9a-f]{64}$ \
+  && "$before_sha256" != "$after_sha256" \
+  && "$crypttab_before_sha256" != "$crypttab_after_sha256" \
+  && "$resolver_before_sha256" != "$resolver_after_sha256" ]] || exit 1
 
 truncate -s 256M -- "$target_image"
 mkfs.ext4 -q -F -U 11111111-1111-4111-8111-111111111111 \
@@ -166,6 +203,20 @@ debugfs -w -R "set_inode_field /etc mode 040755" "$target_image" >/dev/null 2>&1
 debugfs -w -R "set_inode_field /etc/fstab uid 0" "$target_image" >/dev/null 2>&1
 debugfs -w -R "set_inode_field /etc/fstab gid 0" "$target_image" >/dev/null 2>&1
 debugfs -w -R "set_inode_field /etc/fstab mode 0100644" "$target_image" >/dev/null 2>&1
+for directory in \
+  /usr /usr/lib /usr/lib/systemd /usr/lib/systemd/system \
+  /etc/systemd /etc/systemd/system /etc/systemd/system/multi-user.target.wants; do
+  debugfs -w -R "set_inode_field $directory uid 0" "$target_image" >/dev/null 2>&1
+  debugfs -w -R "set_inode_field $directory gid 0" "$target_image" >/dev/null 2>&1
+  debugfs -w -R "set_inode_field $directory mode 040755" "$target_image" >/dev/null 2>&1
+done
+for regular in /etc/crypttab /usr/lib/systemd/system/systemd-resolved.service; do
+  debugfs -w -R "set_inode_field $regular uid 0" "$target_image" >/dev/null 2>&1
+  debugfs -w -R "set_inode_field $regular gid 0" "$target_image" >/dev/null 2>&1
+  debugfs -w -R "set_inode_field $regular mode 0100644" "$target_image" >/dev/null 2>&1
+done
+debugfs -w -R "set_inode_field /etc/systemd/system/multi-user.target.wants/systemd-resolved.service uid 0" "$target_image" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /etc/systemd/system/multi-user.target.wants/systemd-resolved.service gid 0" "$target_image" >/dev/null 2>&1
 target_before_sha256="$(sha256sum "$target_image" | awk '{print $1}')"
 
 iso_bytes="$(stat -c '%s' -- "$iso")"
@@ -242,6 +293,23 @@ if [[ -n "$provisioned_base" ]]; then
   already_provisioned=true
 fi
 
+if [[ "$scenario" == ext4-apply ]]; then
+  # Create one deterministic, preen-repairable inconsistency only in this
+  # isolated scenario copy. The shared provisioned base remains byte-exact.
+  ext4_marker_inode="$(
+    debugfs -R "stat /srv/archive/ext4-repair-marker" "$target_image" 2>/dev/null \
+      | awk '/^Inode:/ {print $2}'
+  )"
+  [[ "$ext4_marker_inode" =~ ^[1-9][0-9]*$ ]] || exit 1
+  debugfs -w -R "clri <$ext4_marker_inode>" "$target_image" >/dev/null 2>&1
+  set +e
+  e2fsck -f -n "$target_image" >"$work_dir/ext4-preflight.out" 2>&1
+  ext4_preflight_status=$?
+  set -e
+  [[ "$ext4_preflight_status" -eq 4 ]] || exit 1
+  target_before_sha256="$(sha256sum "$target_image" | awk '{print $1}')"
+fi
+
 if [[ "$firmware" == uefi ]]; then
   for pair in \
     /usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd \
@@ -296,13 +364,23 @@ controller_scenario="$scenario"
 if [[ "$scenario" == failure-paths || "$scenario" == qualification-batch ]]; then
   controller_scenario=provision-base
 fi
+controller_before_sha256="$before_sha256"
+controller_after_sha256="$after_sha256"
+if [[ "$scenario" == crypttab-lifecycle ]]; then
+  controller_before_sha256="$crypttab_before_sha256"
+  controller_after_sha256="$crypttab_after_sha256"
+elif [[ "$scenario" == resolver-link-apply ]]; then
+  controller_before_sha256="$resolver_before_sha256"
+  controller_after_sha256="$resolver_after_sha256"
+fi
 controller_args=(
   --qemu "$(command -v qemu-system-x86_64)"
   --qmp-socket "$qmp_socket"
   --firmware "$firmware"
   --scenario "$controller_scenario"
   --vault-key-fd 3 --login-credential-fd 4
-  --before-sha256 "$before_sha256" --after-sha256 "$after_sha256"
+  --before-sha256 "$controller_before_sha256"
+  --after-sha256 "$controller_after_sha256"
   --timeout "$controller_timeout"
 )
 if [[ "$already_provisioned" == true ]]; then
@@ -349,6 +427,9 @@ if [[ "$scenario" == failure-paths || "$scenario" == qualification-batch ]]; the
       uefi:backup-tamper
       uefi:repaird-termination
       uefi:auto-restore
+      uefi:crypttab-lifecycle
+      uefi:ext4-apply
+      uefi:resolver-link-apply
     )
     for qualification_case in "${qualification_cases[@]}"; do
       case_firmware="${qualification_case%%:*}"
@@ -374,7 +455,7 @@ if [[ "$scenario" == failure-paths || "$scenario" == qualification-batch ]]; the
       count="$iso_bytes" status=none | sha256sum | awk '{print $1}')"
     [[ "$prefix_after_sha256" == "$iso_sha256" ]] || exit 1
     printf '%s\n' \
-      "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 provisioning=shared scenarios=bios-apply,uefi-apply,uefi-rollback,uefi-interrupt-reconcile,uefi-stale-target,uefi-cancel,uefi-backup-tamper,uefi-repaird-termination,uefi-auto-restore isolated_sparse_copies=true iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false ready=true"
+      "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1 provisioning=shared scenarios=bios-apply,uefi-apply,uefi-rollback,uefi-interrupt-reconcile,uefi-stale-target,uefi-cancel,uefi-backup-tamper,uefi-repaird-termination,uefi-auto-restore,uefi-crypttab-lifecycle,uefi-ext4-apply,uefi-resolver-link-apply actions=linux.fstab.disable-missing-uuid.v1,linux.crypttab.disable-missing-uuid.v1,linux.ext4.fsck-preen-with-undo.v1,linux.network.restore-resolver-link.v1 isolated_sparse_copies=true iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false ready=true"
     exit 0
   fi
 
@@ -450,6 +531,18 @@ elif [[ "$scenario" == repaird-termination ]]; then
   expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=uefi scenario=repaird-termination before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=restored process=repaird-only recovery=closed-before-unchanged target_writes=zero ready=true"
   expected_fstab="$seed/etc/fstab"
   expected_terminal=restored
+elif [[ "$scenario" == crypttab-lifecycle ]]; then
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.crypttab.disable-missing-source.v1 firmware=uefi scenario=crypttab-lifecycle before_sha256=$controller_before_sha256 after_sha256=$controller_after_sha256 vault_distinct=true apply=committed terminal=rolled-back-original rollback=fresh-typed-single-use exact_bytes=restored ready=true"
+  expected_fstab="$seed/etc/fstab"
+  expected_terminal=rolled-back-original
+elif [[ "$scenario" == ext4-apply ]]; then
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.ext4.fsck-preen-with-undo.v1 firmware=uefi scenario=ext4-apply contract_hashes=validated vault_distinct=true terminal=committed postcheck=clean same_boot_undo=armed postcommit_rollback=unavailable approval=typed-single-use ready=true"
+  expected_fstab="$seed/etc/fstab"
+  expected_terminal=committed
+elif [[ "$scenario" == resolver-link-apply ]]; then
+  expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.network.restore-resolver-link.v1 firmware=uefi scenario=resolver-link-apply before_sha256=$controller_before_sha256 after_sha256=$controller_after_sha256 vault_distinct=true terminal=committed link=resolved-stub-relative rollback=automatic-on-failure approval=typed-single-use ready=true"
+  expected_fstab="$seed/etc/fstab"
+  expected_terminal=committed
 else
   expected_guest="KERNAID_QEMU_REPAIR_CANDIDATE_GUEST_V1 action=linux.fstab.disable-missing-uuid.v1 firmware=uefi scenario=auto-restore before_sha256=$before_sha256 after_sha256=$after_sha256 vault_distinct=true terminal=restored fault=after-installed recovery=closed-before-restored target_writes=positive ready=true"
   expected_fstab="$seed/etc/fstab"
@@ -472,11 +565,51 @@ grep -Eq '^File ACL:[[:space:]]+0([[:space:]]|$)' "$observed_fstab_stat"
 if grep -Eq '^Extended attributes:' "$observed_fstab_stat"; then
   exit 1
 fi
-if grep -Eq 'kernaid-fstab-(stage|restore)-v1' "$observed_etc_listing"; then
+if grep -Eq 'kernaid-(fstab|crypttab|resolv\.conf)-(stage|restore)-v1' \
+  "$observed_etc_listing"; then
   exit 1
 fi
+
+if [[ "$scenario" == crypttab-lifecycle ]]; then
+  debugfs -R "dump -p /etc/crypttab $observed_crypttab" \
+    "$target_image" >/dev/null 2>&1
+  debugfs -R "stat /etc/crypttab" "$target_image" \
+    >"$observed_crypttab_stat" 2>/dev/null
+  cmp -s -- "$seed/etc/crypttab" "$observed_crypttab"
+  grep -Eq '^Inode: [0-9]+[[:space:]]+Type: regular[[:space:]]+Mode:[[:space:]]+0644' \
+    "$observed_crypttab_stat"
+  grep -Eq '^User:[[:space:]]+0[[:space:]]+Group:[[:space:]]+0([[:space:]]|$)' \
+    "$observed_crypttab_stat"
+  grep -Eq '^File ACL:[[:space:]]+0([[:space:]]|$)' "$observed_crypttab_stat"
+  if grep -Eq '^Extended attributes:' "$observed_crypttab_stat"; then
+    exit 1
+  fi
+elif [[ "$scenario" == resolver-link-apply ]]; then
+  debugfs -R "stat /etc/resolv.conf" "$target_image" \
+    >"$observed_resolver_stat" 2>/dev/null
+  grep -Eq '^Inode: [0-9]+[[:space:]]+Type: symlink[[:space:]]+Mode:[[:space:]]+0777' \
+    "$observed_resolver_stat"
+  grep -Eq '^User:[[:space:]]+0[[:space:]]+Group:[[:space:]]+0([[:space:]]|$)' \
+    "$observed_resolver_stat"
+  grep -Fqx 'Fast link dest: "../run/systemd/resolve/stub-resolv.conf"' \
+    "$observed_resolver_stat"
+  grep -Eq '^File ACL:[[:space:]]+0([[:space:]]|$)' "$observed_resolver_stat"
+  if grep -Eq '^Extended attributes:' "$observed_resolver_stat"; then
+    exit 1
+  fi
+elif [[ "$scenario" == ext4-apply ]]; then
+  ext4_before_postcheck_sha256="$(sha256sum "$target_image" | awk '{print $1}')"
+  set +e
+  e2fsck -f -n "$target_image" >"$work_dir/ext4-postcheck.out" 2>&1
+  ext4_postcheck_status=$?
+  set -e
+  [[ "$ext4_postcheck_status" -eq 0 \
+    && "$(sha256sum "$target_image" | awk '{print $1}')" \
+      == "$ext4_before_postcheck_sha256" ]] || exit 1
+fi
 target_after_sha256="$(sha256sum "$target_image" | awk '{print $1}')"
-if [[ "$scenario" == apply ]]; then
+if [[ "$scenario" == apply || "$scenario" == crypttab-lifecycle \
+  || "$scenario" == ext4-apply || "$scenario" == resolver-link-apply ]]; then
   [[ "$target_after_sha256" != "$target_before_sha256" ]]
 elif [[ "$scenario" == stale-target || "$scenario" == cancel \
   || "$scenario" == repaird-termination ]]; then
@@ -490,6 +623,12 @@ prefix_after_sha256="$(dd if="$rescue_media" bs=4M iflag=count_bytes \
 
 if [[ "$scenario" == rollback || "$scenario" == backup-tamper ]]; then
   attested_action=linux.fstab.restore
+elif [[ "$scenario" == crypttab-lifecycle ]]; then
+  attested_action=linux.crypttab.disable-missing-source.v1
+elif [[ "$scenario" == ext4-apply ]]; then
+  attested_action=linux.ext4.fsck-preen-with-undo.v1
+elif [[ "$scenario" == resolver-link-apply ]]; then
+  attested_action=linux.network.restore-resolver-link.v1
 else
   attested_action=linux.fstab.disable-missing-uuid.v1
 fi
@@ -503,9 +642,26 @@ case "$scenario" in
   auto-restore)
     failure_attestation=" target_writes=positive final_state=before recovery=closed-before-restored"
     ;;
+  crypttab-lifecycle)
+    failure_attestation=" apply=committed rollback=fresh-typed-single-use target_writes=positive"
+    ;;
+  ext4-apply)
+    failure_attestation=" target_writes=positive"
+    ;;
+  resolver-link-apply)
+    failure_attestation=" rollback=automatic-on-failure target_writes=positive"
+    ;;
   *)
     failure_attestation=""
     ;;
 esac
+resource_attestation="before_sha256=$controller_before_sha256 after_sha256=$controller_after_sha256 exact_bytes=true metadata=mode-uid-gid-no-xattrs"
+if [[ "$scenario" == crypttab-lifecycle ]]; then
+  resource_attestation="before_sha256=$controller_before_sha256 after_sha256=$controller_after_sha256 exact_bytes=restored metadata=mode-uid-gid-no-xattrs"
+elif [[ "$scenario" == ext4-apply ]]; then
+  resource_attestation="contract_hashes=validated postcheck=clean same_boot_undo=armed"
+elif [[ "$scenario" == resolver-link-apply ]]; then
+  resource_attestation="before_sha256=$controller_before_sha256 after_sha256=$controller_after_sha256 exact_link=resolved-stub-relative metadata=uid-gid-no-xattrs"
+fi
 printf '%s\n' \
-  "KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 action=$attested_action firmware=$firmware scenario=$scenario drives=rescue-usb,target-ext4 physical_parents=distinct vault=luks2-ext4 before_sha256=$before_sha256 after_sha256=$after_sha256 exact_bytes=true metadata=mode-uid-gid-no-xattrs stage_cleanup=true terminal=$expected_terminal iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false${failure_attestation} ready=true"
+  "KERNAID_QEMU_REPAIR_CANDIDATE_ATTESTATION_V1 action=$attested_action firmware=$firmware scenario=$scenario drives=rescue-usb,target-ext4 physical_parents=distinct vault=luks2-ext4 $resource_attestation stage_cleanup=true terminal=$expected_terminal iso_sha256=$iso_sha256 iso_prefix_immutable=true host_physical_devices=false${failure_attestation} ready=true"

@@ -323,7 +323,7 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertEqual(source.count("id=kernaid_repair_target_device"), 1)
         self.assertEqual(source.count("serial=KERNAID-REPAIR-V1"), 1)
         self.assertIn("mkfs.ext4", source)
-        self.assertIn('"$seed/usr"', source)
+        self.assertIn('"$seed/usr/lib/systemd/system"', source)
         self.assertIn("-return_with FAILURE 32", source)
         self.assertIn('[[ -f "$squashfs" && ! -L "$squashfs" ]]', source)
         for required in (
@@ -333,6 +333,12 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             'set_inode_field /etc/fstab uid 0',
             'set_inode_field /etc/fstab gid 0',
             'set_inode_field /etc/fstab mode 0100644',
+            "for regular in /etc/crypttab "
+            "/usr/lib/systemd/system/systemd-resolved.service",
+            'set_inode_field $regular uid 0',
+            'set_inode_field $regular gid 0',
+            'set_inode_field $regular mode 0100644',
+            "/etc/systemd/system/multi-user.target.wants",
         ):
             self.assertIn(required, source)
         self.assertIn("physical_parents=distinct", source)
@@ -479,6 +485,9 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             "uefi:backup-tamper",
             "uefi:repaird-termination",
             "uefi:auto-restore",
+            "uefi:crypttab-lifecycle",
+            "uefi:ext4-apply",
+            "uefi:resolver-link-apply",
         ):
             self.assertIn(scenario, source)
         self.assertIn("controller_timeout=1500", source)
@@ -496,11 +505,18 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             "KERNAID_QEMU_REPAIR_QUALIFICATION_BATCH_ATTESTATION_V1",
             source,
         )
+        self.assertIn(
+            "actions=linux.fstab.disable-missing-uuid.v1,"
+            "linux.crypttab.disable-missing-uuid.v1,"
+            "linux.ext4.fsck-preen-with-undo.v1,"
+            "linux.network.restore-resolver-link.v1",
+            source,
+        )
 
     def test_repair_shutdown_keeps_a_bounded_tcg_safe_budget(self) -> None:
         source = CONTROLLER.read_text(encoding="utf-8")
         self.assertEqual(controller.REPAIR_ACPI_SHUTDOWN_SECONDS, 300.0)
-        self.assertEqual(source.count("REPAIR_ACPI_SHUTDOWN_SECONDS)"), 7)
+        self.assertEqual(source.count("REPAIR_ACPI_SHUTDOWN_SECONDS)"), 8)
         self.assertNotIn(
             "wait_for_shutdown(LIFECYCLE._deadline(aggregate, 180.0))", source
         )
@@ -596,7 +612,8 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         ):
             self.assertIn(required.encode("ascii"), generated)
 
-        self.assertIn('"interrupt-reconcile", *FAILURE_SCENARIOS', source)
+        self.assertIn('"interrupt-reconcile",', source)
+        self.assertIn("*PACK_QUALIFICATION_SCENARIOS", source)
         self.assertIn('"scenario-firmware-invalid"', source)
         self.assertIn('expected_fstab="$seed/etc/fstab"', shell)
         self.assertIn('cmp -s -- "$expected_fstab" "$observed_fstab"', shell)
@@ -615,7 +632,8 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             '"execute-state-closed-before-unchanged"',
             '"execute-state-closed-before-restored"',
             '"manual-reconciliation-required"',
-            '"interrupt-reconcile", *FAILURE_SCENARIOS',
+            '"interrupt-reconcile",',
+            "*PACK_QUALIFICATION_SCENARIOS",
             "OVMF_VARS.repair-boot-{boot}.fd",
         ):
             self.assertIn(required, source)
@@ -797,11 +815,84 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertIn("iso_sha256=$iso_sha256", shell)
         self.assertIn("target_raw_immutable=true", shell)
         self.assertIn("metadata=mode-uid-gid-no-xattrs", shell)
-        self.assertIn("kernaid-fstab-(stage|restore)-v1", shell)
+        self.assertIn(
+            "kernaid-(fstab|crypttab|resolv\\.conf)-(stage|restore)-v1",
+            shell,
+        )
         self.assertIn("realpath -e --", shell)
         self.assertIn("stat -c '%h'", shell)
         self.assertIn('if target_write_bytes(qmp) != 0:', source)
         self.assertIn('elif writes != 0:', source)
+
+    def test_all_compiled_repair_packs_have_closed_exact_image_proofs(self) -> None:
+        shell = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(
+            controller.PACK_QUALIFICATION_SCENARIOS,
+            ("crypttab-lifecycle", "ext4-apply", "resolver-link-apply"),
+        )
+        expected = {
+            "crypttab-lifecycle": (
+                b"repair.crypttab.prepare",
+                b"repair.crypttab.approve",
+                b"linux.crypttab.disable-missing-uuid.v1",
+                b"rescue:selected-linux-root:etc/crypttab",
+                b"DISABILITA VOCE CRYPTTAB",
+            ),
+            "ext4-apply": (
+                b"repair.ext4.prepare",
+                b"repair.ext4.approve",
+                b"linux.ext4.fsck-preen-with-undo.v1",
+                b"rescue:selected-linux-filesystem:ext4",
+                b"REPAIR EXT4 OFFLINE",
+            ),
+            "resolver-link-apply": (
+                b"repair.resolver-link.prepare",
+                b"repair.resolver-link.approve",
+                b"linux.network.restore-resolver-link.v1",
+                b"rescue:selected-linux-root:etc/resolver-link",
+                b"RESTORE RESOLVER LINK",
+            ),
+        }
+        for scenario, tokens in expected.items():
+            with self.subTest(scenario=scenario):
+                generated = controller.pack_qualification_source(
+                    scenario,
+                    "sha256:" + "a" * 64,
+                    "sha256:" + "b" * 64,
+                )
+                self.assertLessEqual(len(generated), 16 * 1024)
+                compile(generated, f"<{scenario}>", "exec")
+                for token in tokens:
+                    self.assertIn(token, generated)
+                self.assertIn(b"prepared_keys={", generated)
+                self.assertIn(b"deadline=time.monotonic()+600", generated)
+                self.assertIn(b'"approvalSequence":detail["nextApprovalSequence"]', generated)
+                self.assertIn(b'"typedConfirmation":CONFIRMATION', generated)
+                self.assertNotIn(b"/dev/", generated)
+                self.assertNotIn(b"subprocess", generated)
+
+        crypttab = controller.pack_qualification_source(
+            "crypttab-lifecycle",
+            "sha256:" + "a" * 64,
+            "sha256:" + "b" * 64,
+        )
+        self.assertIn(b"repair.crypttab.rollback.prepare", crypttab)
+        self.assertIn(b"repair.crypttab.rollback.approve", crypttab)
+        self.assertIn(b"RIPRISTINA CRYPTTAB ORIGINALE", crypttab)
+        self.assertIn(b"while rollback_approval==apply_approval", crypttab)
+
+        for required in (
+            "KERNAID_EXT4_REPAIR_MARKER",
+            'debugfs -w -R "clri <$ext4_marker_inode>"',
+            'e2fsck -f -n "$target_image"',
+            "ext4_preflight_status\" -eq 4",
+            "ext4_postcheck_status\" -eq 0",
+            "resolver-link-state:v1:missing",
+            "resolver-link-state:v1:resolved-stub-relative",
+            'Fast link dest: \"../run/systemd/resolve/stub-resolv.conf\"',
+            "kernaid-(fstab|crypttab|resolv\\.conf)-(stage|restore)-v1",
+        ):
+            self.assertIn(required, shell)
 
     def test_candidate_only_fault_credentials_are_fixed_and_scenario_bound(self) -> None:
         shell = SCRIPT.read_text(encoding="utf-8")
