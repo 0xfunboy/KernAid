@@ -87,6 +87,20 @@ class LifecycleSmokeStaticTests(unittest.TestCase):
         self.assertEqual(macos.count("target: aarch64-apple-darwin"), 1)
         self.assertEqual(macos.count("target: x86_64-apple-darwin"), 1)
 
+    def test_linux_setup_bootstraps_identity_only_for_explicit_enable(self) -> None:
+        setup = (
+            REPO / "deploy/fleet-resident-linux/kernaid-fleet-resident-setup"
+        ).read_text(encoding="utf-8")
+        bootstrap = (
+            "/usr/libexec/kernaid-fleet-resident-sync \\\n"
+            '    --config "$config_dir/fleet-resident.json" \\\n'
+            "    --initialize-identity \\\n"
+            "    --once"
+        )
+        self.assertEqual(setup.count(bootstrap), 1)
+        self.assertLess(setup.index("if ((enable_services)); then"), setup.index(bootstrap))
+        self.assertLess(setup.index(bootstrap), setup.index("systemctl --user enable --now"))
+
 
 if __name__ == "__main__":
     unittest.main()

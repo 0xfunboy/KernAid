@@ -7,10 +7,13 @@ Build it explicitly with:
 cargo build --release -p kernaid-fleet-resident-sync --features linux-resident
 ```
 
-The process is a systemd **user** service because the existing `resident-v1`
-device identity lives in the user's Linux Secret Service keyring. It never
-creates or replaces that identity. It opens a separate private Fleet state
-directory, loads the already-protected identity, and drives the durable
+The process is a systemd **user** service because the `resident-v1` device
+identity lives in the user's Linux Secret Service keyring. Normal service
+startup never creates or replaces that identity. The explicit first-run
+`--initialize-identity --once` path may create it only when absent, then uses
+the same closed enrollment cycle without exporting its seed. Bootstrap locks
+the shared private application-data root and therefore refuses to race a Desk
+instance. The process opens a separate private Fleet state directory and drives the durable
 `fleet-coordinator` inventory/audit outboxes and signed policy/entitlement
 pulls. There is no remote-command route or repair authority.
 

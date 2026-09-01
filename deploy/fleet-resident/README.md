@@ -10,7 +10,12 @@ This integration is intentionally off by default.
    files. They are public data but must not be writable by another user.
 4. Ask the tenant administrator for a short-lived enrollment token, write only
    that token plus an optional final newline to the configured mode-0600 token
-   file, then start the service once. Successful enrollment removes the file.
+   file, then run the service once with `--initialize-identity --once`.
+   This explicit first run creates the non-exportable `resident-v1` identity
+   only when it is absent, enrolls it and removes the token only after the
+   matching response and durable enrollment commit. Normal service startup
+   never creates or replaces an identity. Close Desk first: bootstrap acquires
+   the same canonical Resident lock and fails closed while Desk is running.
 5. Install the unit in `~/.config/systemd/user/`, run `systemctl --user daemon-reload`,
    and first verify with `systemctl --user start kernaid-fleet-resident-sync`.
    Enable it only after the Fleet endpoint emits signed receipt headers.

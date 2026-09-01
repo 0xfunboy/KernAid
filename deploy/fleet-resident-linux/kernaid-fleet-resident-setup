@@ -152,6 +152,10 @@ install -m 0644 "$share_dir/systemd/user/kernaid-fleet-resident-update.service" 
 
 systemctl --user daemon-reload
 if ((enable_services)); then
+  /usr/libexec/kernaid-fleet-resident-sync \
+    --config "$config_dir/fleet-resident.json" \
+    --initialize-identity \
+    --once
   systemctl --user enable --now \
     kernaid-fleet-resident-sync.service \
     kernaid-fleet-resident-work-orders.service
@@ -167,6 +171,7 @@ fi
 
 echo "KernAid Fleet Resident is configured for tenant $tenant_id."
 if ((!enable_services)); then
-  echo "Run: systemctl --user enable --now kernaid-fleet-resident-sync kernaid-fleet-resident-work-orders"
+  echo "First enroll: /usr/libexec/kernaid-fleet-resident-sync --config $config_dir/fleet-resident.json --initialize-identity --once"
+  echo "Then run: systemctl --user enable --now kernaid-fleet-resident-sync kernaid-fleet-resident-work-orders"
 fi
 echo "The signed update stager and A/B activator remain disabled pending device qualification."

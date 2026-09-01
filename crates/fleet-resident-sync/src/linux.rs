@@ -21,6 +21,7 @@ use rustix::{
 use sha2::{Digest, Sha256};
 use std::{
     env,
+    ffi::{OsStr, OsString},
     io::Read,
     os::unix::fs::{MetadataExt, PermissionsExt},
     thread,
@@ -197,36 +198,78 @@ impl ResidentObservationSource for SystemObservationSource {
 }
 
 pub fn run_from_args() -> Result<(), ResidentSyncError> {
-    let mut arguments = env::args_os().skip(1);
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--config")) {
+    let options = parse_service_arguments(env::args_os().skip(1))?;
+    let config = load_config(&options.config_path)?;
+    run_service(config, options.once, options.initialize_identity)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResidentSyncServiceOptions {
+    config_path: PathBuf,
+    once: bool,
+    initialize_identity: bool,
+}
+
+fn parse_service_arguments(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<ResidentSyncServiceOptions, ResidentSyncError> {
+    let mut arguments = arguments.into_iter();
+    if arguments.next().as_deref() != Some(OsStr::new("--config")) {
         return Err(ResidentSyncError::InvalidConfig);
     }
     let config_path = arguments.next().ok_or(ResidentSyncError::InvalidConfig)?;
-    let once = match arguments.next() {
-        None => false,
-        Some(value) if value == "--once" => true,
-        Some(_) => return Err(ResidentSyncError::InvalidConfig),
-    };
-    if arguments.next().is_some() {
+    if config_path.is_empty() {
         return Err(ResidentSyncError::InvalidConfig);
     }
-    let config_path = PathBuf::from(config_path);
-    let config = load_config(&config_path)?;
-    run_service(config, once)
+    let mut once = false;
+    let mut initialize_identity = false;
+    for argument in arguments {
+        if argument == OsStr::new("--once") && !once {
+            once = true;
+        } else if argument == OsStr::new("--initialize-identity") && !initialize_identity {
+            initialize_identity = true;
+        } else {
+            return Err(ResidentSyncError::InvalidConfig);
+        }
+    }
+    if initialize_identity && !once {
+        return Err(ResidentSyncError::InvalidConfig);
+    }
+    Ok(ResidentSyncServiceOptions {
+        config_path: PathBuf::from(config_path),
+        once,
+        initialize_identity,
+    })
 }
 
-pub fn run_service(config: ResidentSyncConfig, once: bool) -> Result<(), ResidentSyncError> {
+pub fn run_service(
+    config: ResidentSyncConfig,
+    once: bool,
+    initialize_identity: bool,
+) -> Result<(), ResidentSyncError> {
+    if initialize_identity && !once {
+        return Err(ResidentSyncError::InvalidConfig);
+    }
     ensure_private_directory(&config.state_directory)?;
     let _lock = open_service_lock(&config.state_directory.join(LOCK_FILE))?;
+    let _identity_initialization_lock = initialize_identity
+        .then(|| open_identity_initialization_lock(&config.state_directory))
+        .transpose()?;
     let service_anchor = read_public_anchor(&config.service_receipt_anchor_file)?;
     let entitlement_anchor = read_public_anchor(&config.entitlement_anchor_file)?;
     let policy_anchor = read_public_anchor(&config.policy_anchor_file)?;
     let mut identity_store = NativeDeviceIdentityStore::open_named(RESIDENT_IDENTITY_NAMESPACE)
         .map_err(|_| ResidentSyncError::IdentityUnavailable)?;
-    let identity = identity_store
+    let identity = match identity_store
         .load_device_identity()
         .map_err(|_| ResidentSyncError::IdentityUnavailable)?
-        .ok_or(ResidentSyncError::IdentityUnavailable)?;
+    {
+        Some(identity) => identity,
+        None if initialize_identity => identity_store
+            .create_device_identity()
+            .map_err(|_| ResidentSyncError::IdentityUnavailable)?,
+        None => return Err(ResidentSyncError::IdentityUnavailable),
+    };
     let coordinator = FleetCoordinator::open(
         FleetCoordinatorConfig {
             coordinator_state_path: &config.state_directory.join(COORDINATOR_DB),
@@ -466,6 +509,27 @@ fn open_service_lock(path: &Path) -> Result<File, ResidentSyncError> {
     Ok(file)
 }
 
+/// Coordinate explicit identity creation with Desk's canonical Resident lock.
+///
+/// The package places Fleet state directly below the same private application
+/// data directory used by Desk. Custom layouts may run normally, but explicit
+/// identity creation is accepted only when that parent is an owned,
+/// non-symlinked and non-shared directory.
+fn open_identity_initialization_lock(state_directory: &Path) -> Result<File, ResidentSyncError> {
+    let parent = state_directory
+        .parent()
+        .ok_or(ResidentSyncError::InvalidState)?;
+    let metadata = fs::symlink_metadata(parent)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != process::getuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(ResidentSyncError::InvalidState);
+    }
+    open_service_lock(&parent.join(".resident-v1.lock"))
+}
+
 fn linux_os_release() -> Result<String, ResidentSyncError> {
     let etc_path = Path::new("/etc/os-release");
     let metadata = fs::symlink_metadata(etc_path)?;
@@ -524,4 +588,61 @@ fn trim_ascii_line(bytes: &[u8]) -> Option<&[u8]> {
 
 fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(values: &[&str]) -> Result<ResidentSyncServiceOptions, ResidentSyncError> {
+        parse_service_arguments(values.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn startup_identity_initialization_is_explicit_and_order_independent() {
+        assert_eq!(
+            parse(&[
+                "--config",
+                "/tmp/resident.json",
+                "--initialize-identity",
+                "--once",
+            ])
+            .expect("explicit bootstrap"),
+            ResidentSyncServiceOptions {
+                config_path: PathBuf::from("/tmp/resident.json"),
+                once: true,
+                initialize_identity: true,
+            }
+        );
+        assert_eq!(
+            parse(&["--config", "/tmp/resident.json", "--once"]).expect("normal service options"),
+            ResidentSyncServiceOptions {
+                config_path: PathBuf::from("/tmp/resident.json"),
+                once: true,
+                initialize_identity: false,
+            }
+        );
+    }
+
+    #[test]
+    fn startup_rejects_implicit_duplicate_or_unknown_identity_controls() {
+        for values in [
+            vec![
+                "--config",
+                "/tmp/resident.json",
+                "--initialize-identity",
+                "--initialize-identity",
+            ],
+            vec!["--config", "/tmp/resident.json", "--once", "--once"],
+            vec!["--config", "/tmp/resident.json", "--create-identity"],
+            vec!["--config", "/tmp/resident.json", "--initialize-identity"],
+            vec!["--config", ""],
+            vec!["--initialize-identity", "/tmp/resident.json"],
+        ] {
+            assert!(
+                matches!(parse(&values), Err(ResidentSyncError::InvalidConfig)),
+                "unexpected accepted arguments: {values:?}"
+            );
+        }
+    }
 }
