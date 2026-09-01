@@ -20,6 +20,15 @@ linux-service = [
   "dep:rustix",
   "dep:rustls",
 ]
+macos-service = [
+  "dep:fs2",
+  "dep:kernaid-macos-pack",
+  "dep:kernaid-native-secrets",
+  "dep:rand_core",
+  "dep:reqwest",
+  "dep:rustix",
+  "dep:rustls",
+]
 windows-service = [
   "dep:fs2",
   "dep:kernaid-native-secrets",
@@ -42,6 +51,11 @@ name = "kernaid-fleet-resident-windows"
 path = "src/windows_main.rs"
 required-features = ["windows-service"]
 
+[[bin]]
+name = "kernaid-fleet-resident-macos"
+path = "src/macos_main.rs"
+required-features = ["macos-service"]
+
 [dependencies]
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -53,6 +67,7 @@ kernaid-fleet-client = { path = "../fleet-client" }
 kernaid-fleet-policy = { path = "../fleet-policy" }
 kernaid-fleet-runtime = { path = "../fleet-runtime" }
 kernaid-linux-pack = { path = "../../packs/linux", optional = true }
+kernaid-macos-pack = { path = "../../packs/macos", optional = true }
 kernaid-native-secrets = { path = "../native-secrets", optional = true }
 kernaid-windows-pack = { path = "../../packs/windows", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }

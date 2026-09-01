@@ -2335,7 +2335,6 @@ dependencies = [
  "kernaid-protocol",
  "kernaid-storage",
  "kernaid-windows-pack",
- "plist",
  "process-wrap",
  "regex",
  "reqwest",
@@ -2514,6 +2513,7 @@ dependencies = [
  "kernaid-fleet-policy",
  "kernaid-fleet-runtime",
  "kernaid-linux-pack",
+ "kernaid-macos-pack",
  "kernaid-native-secrets",
  "kernaid-windows-pack",
  "process-wrap",
@@ -2586,8 +2586,10 @@ dependencies = [
 name = "kernaid-macos-pack"
 version = "0.1.0"
 dependencies = [
+ "plist",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

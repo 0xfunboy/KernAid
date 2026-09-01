@@ -396,6 +396,9 @@ impl DiagnosticCollector for SystemDiagnosticCollector {
             WorkOrderActionId::WindowsP0DiagnoseV1 => {
                 return Err(LocalHandoffErrorCode::StateMismatch);
             }
+            WorkOrderActionId::MacosP0DiagnoseV1 => {
+                return Err(LocalHandoffErrorCode::StateMismatch);
+            }
         }
         .map_err(|_| LocalHandoffErrorCode::ExecutionFailed)?;
         if bytes.is_empty() || bytes.len() > MAX_DIAGNOSTIC_BYTES {
@@ -1068,6 +1071,7 @@ mod tests {
                     Err(LocalHandoffErrorCode::StateMismatch)
                 }
                 WorkOrderActionId::WindowsP0DiagnoseV1 => Err(LocalHandoffErrorCode::StateMismatch),
+                WorkOrderActionId::MacosP0DiagnoseV1 => Err(LocalHandoffErrorCode::StateMismatch),
             }
         }
     }

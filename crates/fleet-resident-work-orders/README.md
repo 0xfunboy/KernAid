@@ -127,3 +127,26 @@ collector or target path. Raw collector output stays in memory; the durable
 execution state and signed Fleet result contain only a SHA-256 digest. A
 completed execution is replayed without recollection after restart, while an
 uncertain mismatched pending record fails closed.
+
+## macOS Intel and Apple silicon service (off by default)
+
+Build the separate native executable explicitly:
+
+```sh
+cargo build --release --target aarch64-apple-darwin \
+  -p kernaid-fleet-resident-work-orders --features macos-service \
+  --bin kernaid-fleet-resident-macos
+```
+
+The only macOS action is `macos.p0.diagnose.v1@1` (diagnosis, R0). Desk and
+Fleet Resident share the same eight fixed native command/normalization
+contracts from `kernaid-macos-pack`. Network input cannot select or alter a
+program, argument, environment, timeout, collector, path or output limit. Raw
+native output stays in memory; durable replay stores only exact execution
+bindings and the terminal digest.
+
+The per-user launchd template, strict public configuration and install/disable
+instructions are under `deploy/fleet-resident-macos/`. Installation never
+loads or enables the LaunchAgent. CI builds separate Intel and Apple-silicon
+development bundles named `UNSIGNED-UNNOTARIZED`; Developer ID signing,
+notarization and physical qualification remain release gates.

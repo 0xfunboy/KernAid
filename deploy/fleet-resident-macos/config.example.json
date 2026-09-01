@@ -1,0 +1,16 @@
+{
+  "schema": "dev.kernaid.fleet.resident-macos-service-config.v1",
+  "endpoint": "https://fleet.example.invalid/",
+  "tenantId": "replace-tenant-id",
+  "stateDirectory": "/Users/REPLACE_USER/Library/Application Support/io.github.0xfunboy.KernAid/fleet-work-orders-macos",
+  "runtimeStateFile": "/Users/REPLACE_USER/Library/Application Support/io.github.0xfunboy.KernAid/fleet/runtime-v1.sqlite3",
+  "serviceReceiptAnchorFile": "/Users/REPLACE_USER/Library/Application Support/KernAid/Trust/fleet-service-receipt.pub",
+  "entitlementAnchorFile": "/Users/REPLACE_USER/Library/Application Support/KernAid/Trust/fleet-entitlement.pub",
+  "policyAnchorFile": "/Users/REPLACE_USER/Library/Application Support/KernAid/Trust/fleet-policy.pub",
+  "intervalSeconds": 60,
+  "minimumBackoffSeconds": 5,
+  "maximumBackoffSeconds": 900,
+  "connectTimeoutSeconds": 10,
+  "requestTimeoutSeconds": 60,
+  "leaseSeconds": 300
+}

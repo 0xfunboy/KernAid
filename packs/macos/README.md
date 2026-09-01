@@ -36,6 +36,11 @@ document completely and honestly records both executed and deliberately
 unqualified scopes; typed query-state fields are authoritative. It must never
 interpolate input from a provider or observed data into a command.
 
+The public `resident` module is the single fixed path/argument and projection
+normalization contract reused by Desk and the off-default Fleet Resident.
+Process execution remains in those platform adapters and cannot be selected by
+a diagnostic request or work order.
+
 The Desk adapter follows that contract and never forwards raw command output to
 the UI. It also derives a hashed storage identity from the same bounded
 `system_profiler` document and rejects the diagnostic run if the quick identity
