@@ -48,6 +48,7 @@ CONTROLLER_TIMEOUT_SECONDS = 2400
 FIRSTBOOT_PROMPT_SETTLE_SECONDS = 1.0
 QMP_SECRET_INPUT_TIMEOUT_SECONDS = 30.0
 QMP_KEY_SETTLE_SECONDS = 0.1
+QMP_LINE_DRAIN_SECONDS = 2.0
 ACPI_SHUTDOWN_SECONDS = 180.0
 SHUTDOWN_RESERVE_SECONDS = ACPI_SHUTDOWN_SECONDS + 15.0
 PROCESS_CLEANUP_SECONDS = 5.0
@@ -1869,6 +1870,10 @@ class QmpClient:
         # delivery would then concatenate credentials.
         for value in secret:
             self._send_paced_qcode(chr(value), settle_seconds)
+        # A correlated QMP response proves only that QEMU accepted the input
+        # event.  Give the emulated keyboard and tty1 one fixed bounded window
+        # to consume the character backlog before committing the line.
+        time.sleep(QMP_LINE_DRAIN_SECONDS)
         self._send_paced_qcode("ret", settle_seconds)
 
     def _send_paced_qcode(self, qcode: str, settle_seconds: float) -> None:
