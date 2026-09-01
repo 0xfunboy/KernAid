@@ -206,6 +206,24 @@ last_prefix_sha256=""
 last_p3_sha256=""
 last_target_sha256=""
 clean_shutdowns=0
+active_boot_log=""
+active_boot_number=""
+active_boot_log_appended=false
+
+append_active_boot_log_once() {
+  if [[ "$active_boot_log_appended" == true \
+    || -z "$active_boot_log" \
+    || ! -f "$active_boot_log" ]]; then
+    return 0
+  fi
+  if ! {
+    printf '%s\n' "===== QEMU USB $firmware boot $active_boot_number ====="
+    cat "$active_boot_log"
+  } >>"$log"; then
+    return 1
+  fi
+  active_boot_log_appended=true
+}
 
 mapper_is_active() {
   cryptsetup status "$1" >/dev/null 2>&1
@@ -506,6 +524,10 @@ cleanup() {
     fi
   elif ! terminate_qemu_bounded; then
     qemu_cleanup_safe=false
+    cleanup_failed=true
+  fi
+  if [[ "$result" -ne 0 ]] && ! append_active_boot_log_once; then
+    echo "Failed to preserve the private QEMU USB boot evidence" >&2
     cleanup_failed=true
   fi
   if [[ "$qemu_cleanup_safe" == true ]]; then
@@ -1034,6 +1056,9 @@ run_boot() {
   local boot="$1"
   local boot_log="$work_dir/qemu-$firmware-boot-$boot.log"
   local qemu_deadline qemu_runtime_status status
+  active_boot_log="$boot_log"
+  active_boot_number="$boot"
+  active_boot_log_appended=false
   # QEMU's -drive and -device values are deliberately comma-delimited strings.
   # shellcheck disable=SC2054
   local qemu_args=(
@@ -1106,10 +1131,7 @@ run_boot() {
         report_rescue_not_ready "$boot_log"
         return 1
       fi
-      {
-        printf '%s\n' "===== QEMU USB $firmware boot $boot ====="
-        cat "$boot_log"
-      } >>"$log"
+      append_active_boot_log_once
       assert_boot_images_unchanged "$boot"
       printf '%s\n' \
         "KERNAID_QEMU_USB_BOOT_READY_V1 firmware=$firmware boot=$boot ready=true" \
@@ -1128,11 +1150,6 @@ run_boot() {
         report_rescue_not_ready "$boot_log"
         return 1
       fi
-      {
-        printf '%s\n' "===== QEMU USB $firmware boot $boot ====="
-        cat "$boot_log"
-      } >>"$log"
-      tail -n 200 "$boot_log"
       echo "QEMU USB boot $boot exited before both readiness markers (status $status)" >&2
       return 1
     elif [[ "$qemu_runtime_status" != "live" ]]; then
@@ -1148,11 +1165,6 @@ run_boot() {
     report_rescue_not_ready "$boot_log"
     return 1
   fi
-  {
-    printf '%s\n' "===== QEMU USB $firmware boot $boot ====="
-    cat "$boot_log"
-  } >>"$log"
-  tail -n 200 "$boot_log"
   echo "QEMU USB boot $boot did not become ready within $boot_timeout_seconds seconds" >&2
   return 1
 }

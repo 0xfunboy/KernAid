@@ -620,8 +620,15 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         self.assertNotIn("KERNAID_RESCUE_NOT_READY:", combined_output)
         self.assertNotIn("private-reason=must-not-escape", combined_output)
         self.assertNotIn("KERNAID_QEMU_USB_BOOT_READY_V1", combined_output)
-        self.assertNotIn(
-            "private-reason=must-not-escape", log.read_text(encoding="utf-8")
+        private_evidence = log.read_text(encoding="utf-8")
+        self.assertEqual(
+            private_evidence.count("===== QEMU USB bios boot 1 ====="), 1
+        )
+        self.assertEqual(
+            private_evidence.count(
+                "KERNAID_RESCUE_NOT_READY: private-reason=must-not-escape"
+            ),
+            1,
         )
 
     def test_mocked_lifecycle_emits_catalog_v2_compatible_evidence(self) -> None:
@@ -629,6 +636,8 @@ class QemuUsbVaultSmokeTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.assertEqual(result.returncode, 0, result.stderr)
         contents = log.read_text(encoding="utf-8")
+        self.assertEqual(contents.count("===== QEMU USB bios boot 1 ====="), 1)
+        self.assertEqual(contents.count("===== QEMU USB bios boot 2 ====="), 1)
         self.assertEqual(contents.count("KERNAID_QEMU_USB_ATTESTATION_V1 "), 1)
         self.assertEqual(
             contents.count("KERNAID_QEMU_USB_VAULT_ATTESTATION_V1 "), 1
