@@ -97,7 +97,7 @@ class SecureBootStateTests(unittest.TestCase):
         self.assertEqual(source.count(f'"{marker}"'), 1)
         self.assertLess(
             source.index('printf \'\\n%s\\n\' "$secure_boot_attestation"'),
-            source.index("echo KERNAID_RESCUE_READY"),
+            source.rindex("echo KERNAID_RESCUE_READY"),
         )
 
 
