@@ -1848,9 +1848,16 @@ class QmpClient:
     def system_powerdown(self) -> None:
         self.execute("system_powerdown")
 
-    def send_hex_line(self, secret: bytearray) -> None:
+    def send_hex_line(
+        self,
+        secret: bytearray,
+        *,
+        settle_seconds: float = QMP_KEY_SETTLE_SECONDS,
+    ) -> None:
         if not secret or any(value not in b"0123456789abcdef" for value in secret):
             raise ClosedFailure("firstboot", "key-alphabet-invalid")
+        if not 0.005 <= settle_seconds <= 0.25:
+            raise ClosedFailure("firstboot", "key-pacing-invalid")
         # A single 64-byte line is 130 key down/up events including Return.
         # Sending that as one QMP burst can overrun the emulated keyboard path:
         # QMP acknowledges command acceptance, not consumption by tty1.  Keep
@@ -1859,10 +1866,10 @@ class QmpClient:
         # transition.  Never retry a whole secret line because a partial
         # delivery would then concatenate credentials.
         for value in secret:
-            self._send_paced_qcode(chr(value))
-        self._send_paced_qcode("ret")
+            self._send_paced_qcode(chr(value), settle_seconds)
+        self._send_paced_qcode("ret", settle_seconds)
 
-    def _send_paced_qcode(self, qcode: str) -> None:
+    def _send_paced_qcode(self, qcode: str, settle_seconds: float) -> None:
         for down in (True, False):
             event = {
                 "type": "key",
@@ -1872,7 +1879,7 @@ class QmpClient:
                 },
             }
             self.execute("input-send-event", {"events": [event]})
-            time.sleep(QMP_KEY_SETTLE_SECONDS)
+            time.sleep(settle_seconds)
 
     def quit(self) -> None:
         self.execute("quit")

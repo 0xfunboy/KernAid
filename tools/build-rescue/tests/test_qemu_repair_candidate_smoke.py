@@ -52,6 +52,7 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             mock.patch.object(
                 controller.LIFECYCLE, "wait_firstboot_attestation"
             ) as firstboot_attestation,
+            mock.patch.object(controller.time, "sleep") as sleep,
         ):
             controller.provision_firstboot(
                 console,
@@ -71,7 +72,20 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
         self.assertEqual(firstboot_attestation.call_args.args[1], 91)
         self.assertEqual(
             qmp.send_hex_line.call_args_list,
-            [mock.call(key), mock.call(key)],
+            [
+                mock.call(
+                    key,
+                    settle_seconds=controller.REPAIR_QMP_KEY_SETTLE_SECONDS,
+                ),
+                mock.call(
+                    key,
+                    settle_seconds=controller.REPAIR_QMP_KEY_SETTLE_SECONDS,
+                ),
+            ],
+        )
+        self.assertEqual(
+            sleep.call_args_list,
+            [mock.call(controller.REPAIR_FIRSTBOOT_PROMPT_SETTLE_SECONDS)] * 2,
         )
 
     @staticmethod
@@ -520,6 +534,9 @@ class QemuRepairCandidateSmokeTests(unittest.TestCase):
             controller.REPAIR_FIRSTBOOT_PROMPT_TIMEOUT_SECONDS,
             1200.0,
         )
+        self.assertEqual(controller.REPAIR_FIRSTBOOT_PROMPT_SETTLE_SECONDS, 1.0)
+        self.assertEqual(controller.REPAIR_QMP_KEY_SETTLE_SECONDS, 0.1)
+        self.assertEqual(controller.REPAIR_QMP_INPUT_TIMEOUT_SECONDS, 30.0)
         self.assertEqual(
             controller.REPAIR_FIRSTBOOT_RESULT_TIMEOUT_SECONDS,
             1800.0,

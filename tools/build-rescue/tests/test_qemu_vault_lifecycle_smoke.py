@@ -2146,6 +2146,28 @@ class QmpTests(unittest.TestCase):
         )
         execute.assert_not_called()
 
+    def test_firstboot_hex_line_accepts_one_bounded_pacing_override(self) -> None:
+        secret = bytearray(b"0")
+        client = controller.QmpClient(mock.Mock(), time.monotonic() + 5)
+        try:
+            with (
+                mock.patch.object(client, "execute"),
+                mock.patch.object(controller.time, "sleep") as sleep,
+            ):
+                client.send_hex_line(secret, settle_seconds=0.1)
+        finally:
+            controller.wipe(secret)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.1)] * 4)
+
+    def test_firstboot_hex_line_rejects_unbounded_pacing_override(self) -> None:
+        client = controller.QmpClient(mock.Mock(), time.monotonic() + 5)
+        with self.assertRaises(controller.ClosedFailure) as failure:
+            client.send_hex_line(bytearray(b"0"), settle_seconds=1.0)
+        self.assertEqual(
+            (failure.exception.stage, failure.exception.code),
+            ("firstboot", "key-pacing-invalid"),
+        )
+
     def test_qmp_capabilities_and_acpi_powerdown_are_correlated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "qmp.sock"

@@ -80,6 +80,9 @@ REPAIR_ACPI_SHUTDOWN_SECONDS = 300.0
 # generic lifecycle budgets. Keep both waits repair-specific and bounded.
 REPAIR_FIRSTBOOT_PROMPT_TIMEOUT_SECONDS = 1200.0
 REPAIR_FIRSTBOOT_RESULT_TIMEOUT_SECONDS = 1800.0
+REPAIR_FIRSTBOOT_PROMPT_SETTLE_SECONDS = 1.0
+REPAIR_QMP_KEY_SETTLE_SECONDS = 0.1
+REPAIR_QMP_INPUT_TIMEOUT_SECONDS = 30.0
 
 EXECUTE_STATE_CLASSIFIER_SOURCE = r'''
 def execute_state_checkpoint(value):
@@ -1450,8 +1453,11 @@ def provision_firstboot(
         LIFECYCLE._deadline(aggregate, REPAIR_FIRSTBOOT_PROMPT_TIMEOUT_SECONDS),
         "firstboot-start",
     )
-    qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
-    qmp.send_hex_line(key)
+    time.sleep(REPAIR_FIRSTBOOT_PROMPT_SETTLE_SECONDS)
+    qmp.set_deadline(
+        LIFECYCLE._deadline(aggregate, REPAIR_QMP_INPUT_TIMEOUT_SECONDS)
+    )
+    qmp.send_hex_line(key, settle_seconds=REPAIR_QMP_KEY_SETTLE_SECONDS)
     confirmation = LIFECYCLE.wait_firstboot_prompt(
         console,
         "confirmation",
@@ -1459,8 +1465,11 @@ def provision_firstboot(
         LIFECYCLE._deadline(aggregate, REPAIR_FIRSTBOOT_PROMPT_TIMEOUT_SECONDS),
         "firstboot-confirmation",
     )
-    qmp.set_deadline(LIFECYCLE._deadline(aggregate, 10.0))
-    qmp.send_hex_line(key)
+    time.sleep(REPAIR_FIRSTBOOT_PROMPT_SETTLE_SECONDS)
+    qmp.set_deadline(
+        LIFECYCLE._deadline(aggregate, REPAIR_QMP_INPUT_TIMEOUT_SECONDS)
+    )
+    qmp.send_hex_line(key, settle_seconds=REPAIR_QMP_KEY_SETTLE_SECONDS)
     LIFECYCLE.wait_firstboot_attestation(
         console,
         confirmation.end(),
