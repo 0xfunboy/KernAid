@@ -25,6 +25,8 @@ services:
       KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE: /run/configs/kernaid_fleet_service_receipt_trust_anchor
       KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE: /run/configs/kernaid_entitlement_trust_anchor
       KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE: /run/configs/kernaid_update_trust_anchor
+      KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE: /run/configs/kernaid_enterprise_license_trust_anchor
+      KERNAID_FLEET_ENTERPRISE_LICENSE_KEY_ID: "${KERNAID_FLEET_ENTERPRISE_LICENSE_KEY_ID:?set the expected commercial key ID}"
       FLEET_CONSOLE_DIR: /opt/kernaid/console
     secrets:
       - source: fleet-root-token
@@ -50,6 +52,11 @@ services:
         mode: 0444
       - source: fleet-update-trust-anchor
         target: /run/configs/kernaid_update_trust_anchor
+        uid: "1000"
+        gid: "1000"
+        mode: 0444
+      - source: fleet-enterprise-license-trust-anchor
+        target: /run/configs/kernaid_enterprise_license_trust_anchor
         uid: "1000"
         gid: "1000"
         mode: 0444
@@ -79,6 +86,8 @@ configs:
     file: "${KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE:?set an absolute public-anchor file path}"
   fleet-update-trust-anchor:
     file: "${KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE:?set an absolute vendor update public-anchor file path}"
+  fleet-enterprise-license-trust-anchor:
+    file: "${KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE:?set an absolute commercial public-anchor file path}"
 
 volumes:
   fleet-data:

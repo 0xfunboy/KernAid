@@ -448,6 +448,12 @@ textarea {
 .domain-icon.entitlement {
   color: var(--amber);
 }
+
+.domain-icon.license {
+  color: #d9f99d;
+  background: rgba(101, 163, 13, 0.16);
+  border-color: rgba(163, 230, 53, 0.3);
+}
 .domain-state {
   color: var(--muted);
   font:

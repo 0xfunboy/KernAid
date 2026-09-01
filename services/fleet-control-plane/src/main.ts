@@ -9,6 +9,8 @@ const controlPlane = new FleetControlPlane({
   serviceReceiptTrustAnchor: config.serviceReceiptTrustAnchor,
   entitlementTrustAnchor: config.entitlementTrustAnchor,
   updateTrustAnchor: config.updateTrustAnchor,
+  enterpriseLicenseTrustAnchor: config.enterpriseLicenseTrustAnchor,
+  enterpriseLicenseKeyId: config.enterpriseLicenseKeyId,
   enrollmentClockSkewMs: config.enrollmentClockSkewMs,
   consoleSessionTtlMs: config.consoleSessionTtlMs,
   consoleDirectory: config.consoleDirectory,

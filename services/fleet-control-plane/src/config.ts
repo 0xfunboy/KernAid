@@ -17,6 +17,8 @@ export interface FleetServiceConfig {
   serviceReceiptTrustAnchor: string;
   entitlementTrustAnchor: string;
   updateTrustAnchor: string;
+  enterpriseLicenseTrustAnchor: string;
+  enterpriseLicenseKeyId: string;
   host: string;
   port: number;
   enrollmentClockSkewMs: number;
@@ -44,6 +46,20 @@ export function loadFleetServiceConfig(
     environment,
     "KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE",
   );
+  const enterpriseLicenseTrustAnchorFile = requiredEnvironment(
+    environment,
+    "KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE",
+  );
+  const enterpriseLicenseKeyId = requiredEnvironment(
+    environment,
+    "KERNAID_FLEET_ENTERPRISE_LICENSE_KEY_ID",
+  );
+  if (
+    enterpriseLicenseKeyId.length > 128 ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(enterpriseLicenseKeyId)
+  ) {
+    throw new Error("KERNAID_FLEET_ENTERPRISE_LICENSE_KEY_ID is invalid");
+  }
   const serviceReceiptSigningKeyFile = requiredEnvironment(
     environment,
     "KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE",
@@ -90,6 +106,10 @@ export function loadFleetServiceConfig(
     updateTrustAnchorFile,
     "KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE",
   );
+  const enterpriseLicenseTrustAnchor = readPublicKeyFile(
+    enterpriseLicenseTrustAnchorFile,
+    "KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE",
+  );
   const serviceReceiptSigningKey = readPrivateSigningKeyFile(
     serviceReceiptSigningKeyFile,
   );
@@ -106,6 +126,8 @@ export function loadFleetServiceConfig(
     serviceReceiptTrustAnchor,
     entitlementTrustAnchor,
     updateTrustAnchor,
+    enterpriseLicenseTrustAnchor,
+    enterpriseLicenseKeyId,
     host: environment.KERNAID_FLEET_HOST ?? "127.0.0.1",
     port: parseIntegerEnvironment(
       environment.KERNAID_FLEET_PORT,

@@ -54,6 +54,8 @@ install -m 444 /secure-export/entitlement.public \
   /absolute/private/fleet-secrets/entitlement.public
 install -m 444 /secure-export/update-vendor.public \
   /absolute/private/fleet-secrets/update-vendor.public
+install -m 444 /secure-export/commercial.public \
+  /absolute/private/fleet-secrets/commercial.public
 openssl genpkey -algorithm Ed25519 -outform DER \
   -out /absolute/private/fleet-secrets/receipt-signing-key.pk8
 chmod 400 /absolute/private/fleet-secrets/receipt-signing-key.pk8
@@ -68,6 +70,8 @@ export KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE=/absolute/private/fleet-se
 export KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/receipt.public
 export KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/entitlement.public
 export KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/update-vendor.public
+export KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/commercial.public
+export KERNAID_FLEET_ENTERPRISE_LICENSE_KEY_ID=vendor-2026-01
 docker compose -f deploy/fleet/compose.yaml build --pull
 docker compose -f deploy/fleet/compose.yaml up -d
 docker compose -f deploy/fleet/compose.yaml ps
@@ -155,6 +159,10 @@ The canonical manifest schema is
 SHA-256 and byte count, SQLite `user_version`, complete sorted table inventory
 and RFC 3339 creation time. Its Ed25519 input is:
 
+Schema v11 adds commercial-license, retained-clock, seat and digest-only audit
+tables without changing this backup format. Online backup, verify and restore
+therefore cover the licensing state and preserve its exact schema version.
+
 ```text
 kernaid:fleet:database-backup:v1\0 || canonical manifest JSON
 ```
@@ -232,6 +240,8 @@ KERNAID_FLEET_SERVICE_RECEIPT_SIGNING_KEY_FILE=/absolute/private/fleet-secrets/r
 KERNAID_FLEET_SERVICE_RECEIPT_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/receipt.public \
 KERNAID_FLEET_ENTITLEMENT_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/entitlement.public \
 KERNAID_FLEET_UPDATE_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/update-vendor.public \
+KERNAID_FLEET_ENTERPRISE_LICENSE_TRUST_ANCHOR_FILE=/absolute/private/fleet-secrets/commercial.public \
+KERNAID_FLEET_ENTERPRISE_LICENSE_KEY_ID=vendor-2026-01 \
   docker compose -f deploy/fleet/compose.yaml config --quiet
 docker build --file deploy/fleet/Dockerfile --tag kernaid/fleet-control-plane:local .
 ```

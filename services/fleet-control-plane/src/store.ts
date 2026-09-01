@@ -42,6 +42,12 @@ import {
   type TenantAccessTargetType,
   type TenantRole,
 } from "./access.js";
+import {
+  enterpriseLicenseFeatures,
+  type EnterpriseLicenseClaims,
+  type EnterpriseLicenseFeature,
+  type EnterpriseLicensePlan,
+} from "./enterprise-license.js";
 
 const MAX_POLICY_STREAMS_PER_TENANT = 256;
 const MAX_RECENT_POLICY_PULL_NONCES_PER_DEVICE = 1024;
@@ -64,6 +70,8 @@ const MAX_LISTED_INCIDENT_CASES = 256;
 const MAX_INCIDENT_WORK_ORDERS_PER_CASE = 256;
 const MAX_INCIDENT_EVENTS_PER_TENANT = 20_000;
 const MAX_LISTED_INCIDENT_EVENTS = 512;
+const MAX_ENTERPRISE_LICENSE_EVENTS = 10_000;
+const MAX_LISTED_ENTERPRISE_LICENSE_EVENTS = 256;
 
 export class StoreConflictError extends Error {}
 export class StoreAuthorizationError extends Error {}
@@ -85,6 +93,9 @@ export class StoreWorkOrderReplayError extends Error {}
 export class StoreWorkOrderStateError extends Error {}
 export class StoreIncidentCaseReplayError extends Error {}
 export class StoreIncidentCaseStateError extends Error {}
+export class StoreEnterpriseLicenseRollbackError extends Error {}
+export class StoreEnterpriseLicenseConflictError extends Error {}
+export class StoreEnterpriseSeatLimitError extends Error {}
 
 interface EnrollmentTokenRow {
   tenant_id: string;
@@ -170,6 +181,60 @@ export interface ListedTenantAccessAuditEvent {
 export interface RevokeTenantAccessCredentialResult {
   credential: TenantAccessCredential;
   idempotent: boolean;
+}
+
+export type EnterpriseSeatKind = "device" | "technician";
+
+export interface StoredEnterpriseLicense {
+  tenantId: string;
+  licenseId: string;
+  sequence: number;
+  keyId: string;
+  plan: EnterpriseLicensePlan;
+  features: EnterpriseLicenseFeature[];
+  deviceLimit: number;
+  seatLimit: number;
+  issuedAtUnix: number;
+  notBeforeUnix: number;
+  expiresAtUnix: number;
+  graceUntilUnix: number;
+  envelopeSha256: string;
+  canonicalJson: string;
+  importedAt: string;
+  revokedAt: string | null;
+}
+
+export interface EnterpriseLicenseSeat {
+  assignmentId: string;
+  tenantId: string;
+  kind: EnterpriseSeatKind;
+  subjectId: string;
+  assignedAt: string;
+  revokedAt: string | null;
+}
+
+export interface EnterpriseLicenseEvent {
+  tenantId: string;
+  sequence: number;
+  occurredAt: string;
+  kind:
+    | "clock_rollback"
+    | "license_imported"
+    | "license_revoked"
+    | "seat_assigned"
+    | "seat_revoked";
+  actorId: string;
+  detailSha256: string;
+}
+
+export interface EnterpriseLicenseImportResult {
+  license: StoredEnterpriseLicense;
+  idempotent: boolean;
+}
+
+export interface EnterpriseClockObservation {
+  retainedClockUnix: number;
+  rollbackDetected: boolean;
 }
 
 export type WorkOrderStatus =
@@ -356,6 +421,287 @@ export class FleetStore {
 
   healthCheck(): void {
     this.#database.prepare("SELECT 1 AS healthy").get();
+  }
+
+  importEnterpriseLicense(input: {
+    claims: EnterpriseLicenseClaims;
+    canonicalJson: string;
+    envelopeSha256: string;
+    importedAt: string;
+    actorId: string;
+  }): EnterpriseLicenseImportResult {
+    validateEnterpriseLicenseStoreInput(input);
+    return this.#transaction(() => {
+      const existing = this.#enterpriseLicenseRow(input.claims.tenantId);
+      if (existing !== undefined) {
+        if (input.claims.sequence < existing.sequence) {
+          throw new StoreEnterpriseLicenseRollbackError(
+            "enterprise license sequence rollback",
+          );
+        }
+        if (input.claims.sequence === existing.sequence) {
+          if (input.envelopeSha256 !== existing.envelope_sha256) {
+            throw new StoreEnterpriseLicenseConflictError(
+              "enterprise license sequence conflict",
+            );
+          }
+          return { license: mapEnterpriseLicense(existing), idempotent: true };
+        }
+      }
+      this.#database
+        .prepare(
+          `INSERT INTO enterprise_licenses
+            (tenant_id, license_id, sequence, key_id, plan, features_json,
+             device_limit, seat_limit, issued_at_unix, not_before_unix,
+             expires_at_unix, grace_until_unix, envelope_sha256,
+             canonical_json, imported_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+           ON CONFLICT (tenant_id) DO UPDATE SET
+             license_id = excluded.license_id,
+             sequence = excluded.sequence,
+             key_id = excluded.key_id,
+             plan = excluded.plan,
+             features_json = excluded.features_json,
+             device_limit = excluded.device_limit,
+             seat_limit = excluded.seat_limit,
+             issued_at_unix = excluded.issued_at_unix,
+             not_before_unix = excluded.not_before_unix,
+             expires_at_unix = excluded.expires_at_unix,
+             grace_until_unix = excluded.grace_until_unix,
+             envelope_sha256 = excluded.envelope_sha256,
+             canonical_json = excluded.canonical_json,
+             imported_at = excluded.imported_at,
+             revoked_at = NULL`,
+        )
+        .run(
+          input.claims.tenantId,
+          input.claims.licenseId,
+          input.claims.sequence,
+          input.claims.keyId,
+          input.claims.plan,
+          canonicalJson(input.claims.features),
+          input.claims.deviceLimit,
+          input.claims.seatLimit,
+          input.claims.issuedAtUnix,
+          input.claims.notBeforeUnix,
+          input.claims.expiresAtUnix,
+          input.claims.graceUntilUnix,
+          input.envelopeSha256,
+          input.canonicalJson,
+          input.importedAt,
+        );
+      this.#appendEnterpriseLicenseEvent({
+        tenantId: input.claims.tenantId,
+        occurredAt: input.importedAt,
+        kind: "license_imported",
+        actorId: input.actorId,
+        detailSha256: input.envelopeSha256,
+      });
+      const existingDevices = this.#database
+        .prepare(
+          `SELECT device_id FROM devices
+           WHERE tenant_id = ? AND revoked_at IS NULL ORDER BY device_id
+           LIMIT 100001`,
+        )
+        .all(input.claims.tenantId) as unknown as { device_id: string }[];
+      if (existingDevices.length > 100_000) {
+        throw new StoreEnterpriseSeatLimitError(
+          "existing device population exceeds the supported license bound",
+        );
+      }
+      for (const device of existingDevices) {
+        this.#assignEnterpriseSeat({
+          tenantId: input.claims.tenantId,
+          kind: "device",
+          subjectId: device.device_id,
+          limit: 100_000,
+          actorId: input.actorId,
+          assignedAt: input.importedAt,
+        });
+      }
+      const existingTechnicians = this.#database
+        .prepare(
+          `SELECT credential_id FROM tenant_access_credentials
+           WHERE tenant_id = ? AND credential_id <> 'bootstrap-admin'
+             AND revoked_at IS NULL ORDER BY credential_id LIMIT 10001`,
+        )
+        .all(input.claims.tenantId) as unknown as { credential_id: string }[];
+      if (existingTechnicians.length > 10_000) {
+        throw new StoreEnterpriseSeatLimitError(
+          "existing technician population exceeds the supported license bound",
+        );
+      }
+      for (const credential of existingTechnicians) {
+        this.#assignEnterpriseSeat({
+          tenantId: input.claims.tenantId,
+          kind: "technician",
+          subjectId: credential.credential_id,
+          limit: 10_000,
+          actorId: input.actorId,
+          assignedAt: input.importedAt,
+        });
+      }
+      return {
+        license: mapEnterpriseLicense(
+          this.#enterpriseLicenseRow(input.claims.tenantId)!,
+        ),
+        idempotent: false,
+      };
+    });
+  }
+
+  getEnterpriseLicense(tenantId: string): StoredEnterpriseLicense | undefined {
+    if (!isPublicIdentifier(tenantId)) throw new Error("tenant ID is invalid");
+    const row = this.#enterpriseLicenseRow(tenantId);
+    return row === undefined ? undefined : mapEnterpriseLicense(row);
+  }
+
+  revokeEnterpriseLicense(input: {
+    tenantId: string;
+    licenseId: string;
+    revokedAt: string;
+    actorId: string;
+  }): { license: StoredEnterpriseLicense; idempotent: boolean } | undefined {
+    if (
+      !isPublicIdentifier(input.tenantId) ||
+      !isPublicIdentifier(input.licenseId) ||
+      !isRfc3339(input.revokedAt) ||
+      !isPublicIdentifier(input.actorId)
+    ) {
+      throw new Error("enterprise license revocation is invalid");
+    }
+    return this.#transaction(() => {
+      const existing = this.#enterpriseLicenseRow(input.tenantId);
+      if (existing === undefined || existing.license_id !== input.licenseId) {
+        return undefined;
+      }
+      if (existing.revoked_at !== null) {
+        return { license: mapEnterpriseLicense(existing), idempotent: true };
+      }
+      const changed = this.#database
+        .prepare(
+          `UPDATE enterprise_licenses SET revoked_at = ?
+           WHERE tenant_id = ? AND license_id = ? AND revoked_at IS NULL`,
+        )
+        .run(input.revokedAt, input.tenantId, input.licenseId);
+      if (changed.changes !== 1) {
+        throw new StoreEnterpriseLicenseConflictError(
+          "enterprise license revocation conflicted",
+        );
+      }
+      this.#appendEnterpriseLicenseEvent({
+        tenantId: input.tenantId,
+        occurredAt: input.revokedAt,
+        kind: "license_revoked",
+        actorId: input.actorId,
+        detailSha256: sha256(
+          `kernaid:fleet:enterprise-license-revoke:v1\0${input.licenseId}`,
+        ),
+      });
+      return {
+        license: mapEnterpriseLicense(
+          this.#enterpriseLicenseRow(input.tenantId)!,
+        ),
+        idempotent: false,
+      };
+    });
+  }
+
+  observeEnterpriseClock(input: {
+    tenantId: string;
+    nowUnix: number;
+    rollbackToleranceSeconds: number;
+    occurredAt: string;
+  }): EnterpriseClockObservation {
+    if (
+      !isPublicIdentifier(input.tenantId) ||
+      !Number.isSafeInteger(input.nowUnix) ||
+      input.nowUnix < 0 ||
+      !Number.isSafeInteger(input.rollbackToleranceSeconds) ||
+      input.rollbackToleranceSeconds < 0 ||
+      !isRfc3339(input.occurredAt)
+    ) {
+      throw new Error("enterprise clock observation is invalid");
+    }
+    return this.#transaction(() => {
+      const existing = this.#database
+        .prepare(
+          `SELECT max_observed_unix, rollback_detected_at
+           FROM enterprise_license_clock WHERE tenant_id = ?`,
+        )
+        .get(input.tenantId) as EnterpriseLicenseClockRow | undefined;
+      const retainedClockUnix = Math.max(
+        input.nowUnix,
+        existing?.max_observed_unix ?? 0,
+      );
+      const rollbackDetected =
+        input.nowUnix + input.rollbackToleranceSeconds < retainedClockUnix;
+      if (existing === undefined) {
+        this.#database
+          .prepare(
+            `INSERT INTO enterprise_license_clock
+              (tenant_id, max_observed_unix, rollback_detected_at, updated_at)
+             VALUES (?, ?, NULL, ?)`,
+          )
+          .run(input.tenantId, retainedClockUnix, input.occurredAt);
+      } else {
+        const newDetection =
+          rollbackDetected && existing.rollback_detected_at === null;
+        this.#database
+          .prepare(
+            `UPDATE enterprise_license_clock
+             SET max_observed_unix = ?, rollback_detected_at = ?, updated_at = ?
+             WHERE tenant_id = ?`,
+          )
+          .run(
+            retainedClockUnix,
+            rollbackDetected
+              ? (existing.rollback_detected_at ?? input.occurredAt)
+              : null,
+            input.occurredAt,
+            input.tenantId,
+          );
+        if (newDetection) {
+          this.#appendEnterpriseLicenseEvent({
+            tenantId: input.tenantId,
+            occurredAt: input.occurredAt,
+            kind: "clock_rollback",
+            actorId: "system-clock",
+            detailSha256: sha256(
+              `kernaid:fleet:enterprise-clock-rollback:v1\0${retainedClockUnix}`,
+            ),
+          });
+        }
+      }
+      return { retainedClockUnix, rollbackDetected };
+    });
+  }
+
+  listEnterpriseLicenseSeats(tenantId: string): EnterpriseLicenseSeat[] {
+    if (!isPublicIdentifier(tenantId)) throw new Error("tenant ID is invalid");
+    const rows = this.#database
+      .prepare(
+        `SELECT assignment_id, tenant_id, kind, subject_id, assigned_at,
+                revoked_at FROM enterprise_license_seats
+         WHERE tenant_id = ? ORDER BY kind, subject_id LIMIT 110000`,
+      )
+      .all(tenantId) as unknown as EnterpriseLicenseSeatRow[];
+    return rows.map(mapEnterpriseLicenseSeat);
+  }
+
+  listEnterpriseLicenseEvents(tenantId: string): EnterpriseLicenseEvent[] {
+    if (!isPublicIdentifier(tenantId)) throw new Error("tenant ID is invalid");
+    const rows = this.#database
+      .prepare(
+        `SELECT tenant_id, sequence, occurred_at, kind, actor_id, detail_sha256
+         FROM enterprise_license_events WHERE tenant_id = ?
+         ORDER BY sequence DESC LIMIT ?`,
+      )
+      .all(
+        tenantId,
+        MAX_LISTED_ENTERPRISE_LICENSE_EVENTS,
+      ) as unknown as EnterpriseLicenseEventRow[];
+    return rows.map(mapEnterpriseLicenseEvent);
   }
 
   bindServiceReceiptAnchor(anchorSha256: string): void {
@@ -573,6 +919,7 @@ export class FleetStore {
     role: TenantRole;
     label: string;
     createdAt: string;
+    enterpriseSeat?: { limit: number; actorId: string };
   }): TenantAccessCredential {
     validateCredentialInput(input);
     return this.#transaction(() => {
@@ -586,6 +933,16 @@ export class FleetStore {
         throw new StoreConflictError("tenant credential limit reached");
       }
       try {
+        if (input.enterpriseSeat !== undefined) {
+          this.#assignEnterpriseSeat({
+            tenantId: input.tenantId,
+            kind: "technician",
+            subjectId: input.credentialId,
+            limit: input.enterpriseSeat.limit,
+            actorId: input.enterpriseSeat.actorId,
+            assignedAt: input.createdAt,
+          });
+        }
         this.#insertTenantAccessCredential(input);
       } catch (error) {
         if (isSqliteConstraint(error)) {
@@ -670,6 +1027,13 @@ export class FleetStore {
       if (result.changes !== 1) {
         throw new StoreConflictError("credential revocation conflicted");
       }
+      this.#revokeEnterpriseSeat({
+        tenantId: input.tenantId,
+        kind: "technician",
+        subjectId: input.credentialId,
+        actorId: input.actorCredentialId,
+        revokedAt: input.revokedAt,
+      });
       return {
         credential: { ...credential, revokedAt: input.revokedAt },
         idempotent: false,
@@ -2102,6 +2466,7 @@ export class FleetStore {
     agentVersion: string;
     enrolledAt: string;
     nowMs: number;
+    enterpriseSeat?: { limit: number };
   }): void {
     this.#transaction(() => {
       const token = this.#database
@@ -2120,6 +2485,16 @@ export class FleetStore {
       }
 
       try {
+        if (input.enterpriseSeat !== undefined) {
+          this.#assignEnterpriseSeat({
+            tenantId: input.tenantId,
+            kind: "device",
+            subjectId: input.deviceId,
+            limit: input.enterpriseSeat.limit,
+            actorId: input.deviceId,
+            assignedAt: input.enrolledAt,
+          });
+        }
         this.#database
           .prepare(
             `INSERT INTO devices
@@ -2533,14 +2908,183 @@ export class FleetStore {
     }));
   }
 
-  revokeDevice(tenantId: string, deviceId: string, revokedAt: string): boolean {
-    const result = this.#database
+  revokeDevice(
+    tenantId: string,
+    deviceId: string,
+    revokedAt: string,
+    actorId = deviceId,
+  ): boolean {
+    return this.#transaction(() => {
+      const existing = this.getDevice(tenantId, deviceId);
+      if (existing === undefined) return false;
+      if (existing.revokedAt === null) {
+        const result = this.#database
+          .prepare(
+            `UPDATE devices SET revoked_at = ?
+             WHERE tenant_id = ? AND device_id = ? AND revoked_at IS NULL`,
+          )
+          .run(revokedAt, tenantId, deviceId);
+        if (result.changes !== 1) {
+          throw new StoreConflictError("device revocation conflicted");
+        }
+        this.#revokeEnterpriseSeat({
+          tenantId,
+          kind: "device",
+          subjectId: deviceId,
+          actorId,
+          revokedAt,
+        });
+      }
+      return true;
+    });
+  }
+
+  #enterpriseLicenseRow(tenantId: string): EnterpriseLicenseRow | undefined {
+    return this.#database
       .prepare(
-        `UPDATE devices SET revoked_at = COALESCE(revoked_at, ?)
-         WHERE tenant_id = ? AND device_id = ?`,
+        `SELECT tenant_id, license_id, sequence, key_id, plan, features_json,
+                device_limit, seat_limit, issued_at_unix, not_before_unix,
+                expires_at_unix, grace_until_unix, envelope_sha256,
+                canonical_json, imported_at, revoked_at
+         FROM enterprise_licenses WHERE tenant_id = ?`,
       )
-      .run(revokedAt, tenantId, deviceId);
-    return result.changes === 1;
+      .get(tenantId) as EnterpriseLicenseRow | undefined;
+  }
+
+  #assignEnterpriseSeat(input: {
+    tenantId: string;
+    kind: EnterpriseSeatKind;
+    subjectId: string;
+    limit: number;
+    actorId: string;
+    assignedAt: string;
+  }): { assignmentId: string; idempotent: boolean } {
+    validateEnterpriseSeatMutation(input);
+    const assignmentId = enterpriseSeatAssignmentId(
+      input.tenantId,
+      input.kind,
+      input.subjectId,
+    );
+    const existing = this.#database
+      .prepare(
+        `SELECT assignment_id, tenant_id, kind, subject_id, assigned_at,
+                revoked_at FROM enterprise_license_seats
+         WHERE tenant_id = ? AND kind = ? AND subject_id = ?`,
+      )
+      .get(input.tenantId, input.kind, input.subjectId) as
+      EnterpriseLicenseSeatRow | undefined;
+    if (existing?.revoked_at === null) {
+      return { assignmentId: existing.assignment_id, idempotent: true };
+    }
+    const active = this.#database
+      .prepare(
+        `SELECT COUNT(*) AS count FROM enterprise_license_seats
+         WHERE tenant_id = ? AND kind = ? AND revoked_at IS NULL`,
+      )
+      .get(input.tenantId, input.kind) as { count: number };
+    if (active.count >= input.limit) {
+      throw new StoreEnterpriseSeatLimitError(
+        `${input.kind} enterprise seat limit reached`,
+      );
+    }
+    this.#database
+      .prepare(
+        `INSERT INTO enterprise_license_seats
+          (assignment_id, tenant_id, kind, subject_id, assigned_at, revoked_at)
+         VALUES (?, ?, ?, ?, ?, NULL)
+         ON CONFLICT (tenant_id, kind, subject_id) DO UPDATE SET
+           assigned_at = excluded.assigned_at, revoked_at = NULL`,
+      )
+      .run(
+        assignmentId,
+        input.tenantId,
+        input.kind,
+        input.subjectId,
+        input.assignedAt,
+      );
+    this.#appendEnterpriseLicenseEvent({
+      tenantId: input.tenantId,
+      occurredAt: input.assignedAt,
+      kind: "seat_assigned",
+      actorId: input.actorId,
+      detailSha256: sha256(
+        `kernaid:fleet:enterprise-seat:v1\0${input.kind}\0${input.subjectId}`,
+      ),
+    });
+    return { assignmentId, idempotent: false };
+  }
+
+  #revokeEnterpriseSeat(input: {
+    tenantId: string;
+    kind: EnterpriseSeatKind;
+    subjectId: string;
+    actorId: string;
+    revokedAt: string;
+  }): boolean {
+    validateEnterpriseSeatMutation({
+      ...input,
+      limit: 1,
+      assignedAt: input.revokedAt,
+    });
+    const changed = this.#database
+      .prepare(
+        `UPDATE enterprise_license_seats SET revoked_at = ?
+         WHERE tenant_id = ? AND kind = ? AND subject_id = ?
+           AND revoked_at IS NULL`,
+      )
+      .run(input.revokedAt, input.tenantId, input.kind, input.subjectId);
+    if (changed.changes === 0) return false;
+    this.#appendEnterpriseLicenseEvent({
+      tenantId: input.tenantId,
+      occurredAt: input.revokedAt,
+      kind: "seat_revoked",
+      actorId: input.actorId,
+      detailSha256: sha256(
+        `kernaid:fleet:enterprise-seat:v1\0${input.kind}\0${input.subjectId}`,
+      ),
+    });
+    return true;
+  }
+
+  #appendEnterpriseLicenseEvent(input: {
+    tenantId: string;
+    occurredAt: string;
+    kind: EnterpriseLicenseEvent["kind"];
+    actorId: string;
+    detailSha256: string;
+  }): void {
+    const current = this.#database
+      .prepare(
+        `SELECT COALESCE(MAX(sequence), 0) AS sequence
+         FROM enterprise_license_events WHERE tenant_id = ?`,
+      )
+      .get(input.tenantId) as { sequence: number };
+    const sequence = current.sequence + 1;
+    if (!Number.isSafeInteger(sequence) || sequence < 1) {
+      throw new StoreConflictError(
+        "enterprise license event sequence exhausted",
+      );
+    }
+    this.#database
+      .prepare(
+        `INSERT INTO enterprise_license_events
+          (tenant_id, sequence, occurred_at, kind, actor_id, detail_sha256)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.tenantId,
+        sequence,
+        input.occurredAt,
+        input.kind,
+        input.actorId,
+        input.detailSha256,
+      );
+    this.#database
+      .prepare(
+        `DELETE FROM enterprise_license_events
+         WHERE tenant_id = ? AND sequence <= ?`,
+      )
+      .run(input.tenantId, sequence - MAX_ENTERPRISE_LICENSE_EVENTS);
   }
 
   #insertTenantAccessCredential(input: {
@@ -2945,7 +3489,7 @@ export class FleetStore {
     const version = this.#database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    if (version.user_version > 10) {
+    if (version.user_version > 11) {
       throw new Error(
         `unsupported Fleet database version ${version.user_version}`,
       );
@@ -3737,6 +4281,156 @@ export class FleetStore {
       } finally {
         this.#database.exec("PRAGMA foreign_keys = ON");
       }
+      currentVersion = 10;
+    }
+
+    if (currentVersion === 10) {
+      this.#database.exec("PRAGMA foreign_keys = OFF");
+      try {
+        this.#transaction(() => {
+          this.#database.exec(`
+            CREATE TABLE work_orders_v11 (
+              tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+              work_order_id TEXT NOT NULL,
+              request_id TEXT NOT NULL,
+              request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64 AND
+                request_sha256 NOT GLOB '*[^0-9a-f]*'
+              ),
+              target_device_id TEXT NOT NULL,
+              action_id TEXT NOT NULL CHECK (action_id IN (
+                'linux.boot-critical-path.v1',
+                'linux.filesystem.health.v1',
+                'linux.storage.health.v1',
+                'linux.fstab.disable-missing-uuid.v1',
+                'windows.p0.diagnose.v1'
+              )),
+              action_version INTEGER NOT NULL CHECK (action_version = 1),
+              kind TEXT NOT NULL CHECK (kind IN ('diagnosis', 'repair')),
+              risk TEXT NOT NULL CHECK (risk IN ('R0', 'R1', 'R2', 'R3')),
+              local_approval_required INTEGER NOT NULL CHECK (
+                local_approval_required IN (0, 1)
+              ),
+              status TEXT NOT NULL CHECK (status IN (
+                'pending_approval', 'queued', 'leased', 'succeeded', 'failed',
+                'rejected', 'cancelled', 'expired'
+              )),
+              created_by_credential_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              expires_at_ms INTEGER NOT NULL,
+              approved_by_credential_id TEXT,
+              approved_at TEXT,
+              lease_id TEXT,
+              leased_at TEXT,
+              lease_expires_at TEXT,
+              lease_expires_at_ms INTEGER,
+              outcome TEXT CHECK (outcome IN ('succeeded', 'failed', 'rejected')),
+              result_sha256 TEXT,
+              result_envelope_sha256 TEXT,
+              completed_at TEXT,
+              cancelled_by_credential_id TEXT,
+              cancelled_at TEXT,
+              PRIMARY KEY (tenant_id, work_order_id),
+              UNIQUE (tenant_id, request_id),
+              FOREIGN KEY (tenant_id, target_device_id)
+                REFERENCES devices(tenant_id, device_id),
+              FOREIGN KEY (tenant_id, created_by_credential_id)
+                REFERENCES tenant_access_credentials(tenant_id, credential_id),
+              FOREIGN KEY (tenant_id, approved_by_credential_id)
+                REFERENCES tenant_access_credentials(tenant_id, credential_id),
+              FOREIGN KEY (tenant_id, cancelled_by_credential_id)
+                REFERENCES tenant_access_credentials(tenant_id, credential_id)
+            ) STRICT;
+            INSERT INTO work_orders_v11 SELECT * FROM work_orders;
+            DROP TABLE work_orders;
+            ALTER TABLE work_orders_v11 RENAME TO work_orders;
+            CREATE INDEX work_orders_queue_idx ON work_orders(
+              tenant_id, target_device_id, status, created_at, work_order_id
+            );
+
+            CREATE TABLE enterprise_licenses (
+              tenant_id TEXT PRIMARY KEY REFERENCES tenants(tenant_id),
+              license_id TEXT NOT NULL,
+              sequence INTEGER NOT NULL CHECK (sequence > 0),
+              key_id TEXT NOT NULL,
+              plan TEXT NOT NULL CHECK (plan IN ('fleet', 'enterprise')),
+              features_json TEXT NOT NULL CHECK (
+                length(features_json) BETWEEN 2 AND 2048
+              ),
+              device_limit INTEGER NOT NULL CHECK (
+                device_limit BETWEEN 1 AND 100000
+              ),
+              seat_limit INTEGER NOT NULL CHECK (
+                seat_limit BETWEEN 1 AND 10000
+              ),
+              issued_at_unix INTEGER NOT NULL CHECK (issued_at_unix >= 0),
+              not_before_unix INTEGER NOT NULL CHECK (not_before_unix >= 0),
+              expires_at_unix INTEGER NOT NULL CHECK (expires_at_unix >= 0),
+              grace_until_unix INTEGER NOT NULL CHECK (grace_until_unix >= 0),
+              envelope_sha256 TEXT NOT NULL CHECK (
+                length(envelope_sha256) = 64 AND
+                envelope_sha256 NOT GLOB '*[^0-9a-f]*'
+              ),
+              canonical_json TEXT NOT NULL CHECK (
+                length(canonical_json) BETWEEN 1 AND 16384
+              ),
+              imported_at TEXT NOT NULL,
+              revoked_at TEXT,
+              CHECK (issued_at_unix <= not_before_unix),
+              CHECK (not_before_unix < expires_at_unix),
+              CHECK (expires_at_unix <= grace_until_unix)
+            ) STRICT;
+
+            CREATE TABLE enterprise_license_seats (
+              assignment_id TEXT PRIMARY KEY,
+              tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+              kind TEXT NOT NULL CHECK (kind IN ('device', 'technician')),
+              subject_id TEXT NOT NULL,
+              assigned_at TEXT NOT NULL,
+              revoked_at TEXT,
+              UNIQUE (tenant_id, kind, subject_id)
+            ) STRICT;
+            CREATE INDEX enterprise_license_seats_active_idx
+              ON enterprise_license_seats(tenant_id, kind, revoked_at);
+
+            CREATE TABLE enterprise_license_clock (
+              tenant_id TEXT PRIMARY KEY REFERENCES tenants(tenant_id),
+              max_observed_unix INTEGER NOT NULL CHECK (max_observed_unix >= 0),
+              rollback_detected_at TEXT,
+              updated_at TEXT NOT NULL
+            ) STRICT;
+
+            CREATE TABLE enterprise_license_events (
+              tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+              sequence INTEGER NOT NULL CHECK (sequence > 0),
+              occurred_at TEXT NOT NULL,
+              kind TEXT NOT NULL CHECK (kind IN (
+                'clock_rollback', 'license_imported', 'license_revoked',
+                'seat_assigned', 'seat_revoked'
+              )),
+              actor_id TEXT NOT NULL,
+              detail_sha256 TEXT NOT NULL CHECK (
+                length(detail_sha256) = 64 AND
+                detail_sha256 NOT GLOB '*[^0-9a-f]*'
+              ),
+              PRIMARY KEY (tenant_id, sequence)
+            ) STRICT;
+            CREATE INDEX enterprise_license_events_recent_idx
+              ON enterprise_license_events(tenant_id, sequence DESC);
+
+            PRAGMA user_version = 11;
+          `);
+          const violations = this.#database
+            .prepare("PRAGMA foreign_key_check")
+            .all();
+          if (violations.length !== 0) {
+            throw new Error("Fleet v11 migration violated a foreign key");
+          }
+        });
+      } finally {
+        this.#database.exec("PRAGMA foreign_keys = ON");
+      }
     }
   }
 }
@@ -3751,6 +4445,48 @@ interface ServiceResponseRow {
   status: number;
   response_body: string;
   receipt_json: string;
+}
+
+interface EnterpriseLicenseRow {
+  tenant_id: string;
+  license_id: string;
+  sequence: number;
+  key_id: string;
+  plan: string;
+  features_json: string;
+  device_limit: number;
+  seat_limit: number;
+  issued_at_unix: number;
+  not_before_unix: number;
+  expires_at_unix: number;
+  grace_until_unix: number;
+  envelope_sha256: string;
+  canonical_json: string;
+  imported_at: string;
+  revoked_at: string | null;
+}
+
+interface EnterpriseLicenseSeatRow {
+  assignment_id: string;
+  tenant_id: string;
+  kind: string;
+  subject_id: string;
+  assigned_at: string;
+  revoked_at: string | null;
+}
+
+interface EnterpriseLicenseClockRow {
+  max_observed_unix: number;
+  rollback_detected_at: string | null;
+}
+
+interface EnterpriseLicenseEventRow {
+  tenant_id: string;
+  sequence: number;
+  occurred_at: string;
+  kind: string;
+  actor_id: string;
+  detail_sha256: string;
 }
 
 interface TenantAccessCredentialRow {
@@ -4500,6 +5236,208 @@ function nullableIdentifier(value: string | null): boolean {
 
 function nullableRfc3339(value: string | null): boolean {
   return value === null || isRfc3339(value);
+}
+
+function validateEnterpriseLicenseStoreInput(input: {
+  claims: EnterpriseLicenseClaims;
+  canonicalJson: string;
+  envelopeSha256: string;
+  importedAt: string;
+  actorId: string;
+}): void {
+  const claims = input.claims;
+  if (
+    !isPublicIdentifier(claims.tenantId) ||
+    !isPublicIdentifier(claims.licenseId) ||
+    !isPublicIdentifier(claims.keyId) ||
+    !Number.isSafeInteger(claims.sequence) ||
+    claims.sequence < 1 ||
+    !["fleet", "enterprise"].includes(claims.plan) ||
+    claims.features.length < 1 ||
+    new Set(claims.features).size !== claims.features.length ||
+    claims.features.some(
+      (feature, index) =>
+        !(enterpriseLicenseFeatures as readonly string[]).includes(feature) ||
+        (index > 0 && claims.features[index - 1]! >= feature),
+    ) ||
+    !Number.isSafeInteger(claims.deviceLimit) ||
+    claims.deviceLimit < 1 ||
+    claims.deviceLimit > 100_000 ||
+    !Number.isSafeInteger(claims.seatLimit) ||
+    claims.seatLimit < 1 ||
+    claims.seatLimit > 10_000 ||
+    !Number.isSafeInteger(claims.issuedAtUnix) ||
+    !Number.isSafeInteger(claims.notBeforeUnix) ||
+    !Number.isSafeInteger(claims.expiresAtUnix) ||
+    !Number.isSafeInteger(claims.graceUntilUnix) ||
+    claims.issuedAtUnix > claims.notBeforeUnix ||
+    claims.notBeforeUnix >= claims.expiresAtUnix ||
+    claims.expiresAtUnix > claims.graceUntilUnix ||
+    !isSha256(input.envelopeSha256) ||
+    Buffer.byteLength(input.canonicalJson, "utf8") < 1 ||
+    Buffer.byteLength(input.canonicalJson, "utf8") > 16 * 1024 ||
+    !isRfc3339(input.importedAt) ||
+    !isPublicIdentifier(input.actorId)
+  ) {
+    throw new Error("enterprise license storage input is invalid");
+  }
+}
+
+function mapEnterpriseLicense(
+  row: EnterpriseLicenseRow,
+): StoredEnterpriseLicense {
+  let features: EnterpriseLicenseFeature[];
+  try {
+    const parsed = JSON.parse(row.features_json) as unknown;
+    if (!Array.isArray(parsed)) throw new Error("not an array");
+    features = parsed.map((feature) => {
+      if (
+        typeof feature !== "string" ||
+        !(enterpriseLicenseFeatures as readonly string[]).includes(feature)
+      ) {
+        throw new Error("invalid feature");
+      }
+      return feature as EnterpriseLicenseFeature;
+    });
+    if (
+      canonicalJson(features) !== row.features_json ||
+      new Set(features).size !== features.length
+    ) {
+      throw new Error("non-canonical features");
+    }
+  } catch {
+    throw new Error("stored enterprise license features are invalid");
+  }
+  const mapped = {
+    tenantId: row.tenant_id,
+    licenseId: row.license_id,
+    sequence: row.sequence,
+    keyId: row.key_id,
+    plan: row.plan as EnterpriseLicensePlan,
+    features,
+    deviceLimit: row.device_limit,
+    seatLimit: row.seat_limit,
+    issuedAtUnix: row.issued_at_unix,
+    notBeforeUnix: row.not_before_unix,
+    expiresAtUnix: row.expires_at_unix,
+    graceUntilUnix: row.grace_until_unix,
+    envelopeSha256: row.envelope_sha256,
+    canonicalJson: row.canonical_json,
+    importedAt: row.imported_at,
+    revokedAt: row.revoked_at,
+  };
+  validateEnterpriseLicenseStoreInput({
+    claims: {
+      schema: "dev.kernaid.fleet.enterprise-license.v1",
+      version: 1,
+      licenseId: mapped.licenseId,
+      tenantId: mapped.tenantId,
+      sequence: mapped.sequence,
+      keyId: mapped.keyId,
+      plan: mapped.plan,
+      features: mapped.features,
+      deviceLimit: mapped.deviceLimit,
+      seatLimit: mapped.seatLimit,
+      issuedAtUnix: mapped.issuedAtUnix,
+      notBeforeUnix: mapped.notBeforeUnix,
+      expiresAtUnix: mapped.expiresAtUnix,
+      graceUntilUnix: mapped.graceUntilUnix,
+    },
+    canonicalJson: mapped.canonicalJson,
+    envelopeSha256: mapped.envelopeSha256,
+    importedAt: mapped.importedAt,
+    actorId: "stored-license",
+  });
+  if (mapped.revokedAt !== null && !isRfc3339(mapped.revokedAt)) {
+    throw new Error("stored enterprise license revocation is invalid");
+  }
+  return mapped;
+}
+
+function validateEnterpriseSeatMutation(input: {
+  tenantId: string;
+  kind: EnterpriseSeatKind;
+  subjectId: string;
+  limit: number;
+  actorId: string;
+  assignedAt: string;
+}): void {
+  if (
+    !isPublicIdentifier(input.tenantId) ||
+    !["device", "technician"].includes(input.kind) ||
+    !isPublicIdentifier(input.subjectId) ||
+    !Number.isSafeInteger(input.limit) ||
+    input.limit < 1 ||
+    input.limit > 100_000 ||
+    !isPublicIdentifier(input.actorId) ||
+    !isRfc3339(input.assignedAt)
+  ) {
+    throw new Error("enterprise seat mutation is invalid");
+  }
+}
+
+function enterpriseSeatAssignmentId(
+  tenantId: string,
+  kind: EnterpriseSeatKind,
+  subjectId: string,
+): string {
+  return `seat_${sha256(
+    `kernaid:fleet:enterprise-seat-assignment:v1\0${tenantId}\0${kind}\0${subjectId}`,
+  ).slice(0, 40)}`;
+}
+
+function mapEnterpriseLicenseSeat(
+  row: EnterpriseLicenseSeatRow,
+): EnterpriseLicenseSeat {
+  if (
+    !/^seat_[0-9a-f]{40}$/.test(row.assignment_id) ||
+    !isPublicIdentifier(row.tenant_id) ||
+    !["device", "technician"].includes(row.kind) ||
+    !isPublicIdentifier(row.subject_id) ||
+    !isRfc3339(row.assigned_at) ||
+    (row.revoked_at !== null && !isRfc3339(row.revoked_at))
+  ) {
+    throw new Error("stored enterprise seat is invalid");
+  }
+  return {
+    assignmentId: row.assignment_id,
+    tenantId: row.tenant_id,
+    kind: row.kind as EnterpriseSeatKind,
+    subjectId: row.subject_id,
+    assignedAt: row.assigned_at,
+    revokedAt: row.revoked_at,
+  };
+}
+
+function mapEnterpriseLicenseEvent(
+  row: EnterpriseLicenseEventRow,
+): EnterpriseLicenseEvent {
+  const kinds = [
+    "clock_rollback",
+    "license_imported",
+    "license_revoked",
+    "seat_assigned",
+    "seat_revoked",
+  ] as const;
+  if (
+    !isPublicIdentifier(row.tenant_id) ||
+    !Number.isSafeInteger(row.sequence) ||
+    row.sequence < 1 ||
+    !isRfc3339(row.occurred_at) ||
+    !(kinds as readonly string[]).includes(row.kind) ||
+    !isPublicIdentifier(row.actor_id) ||
+    !isSha256(row.detail_sha256)
+  ) {
+    throw new Error("stored enterprise license event is invalid");
+  }
+  return {
+    tenantId: row.tenant_id,
+    sequence: row.sequence,
+    occurredAt: row.occurred_at,
+    kind: row.kind as EnterpriseLicenseEvent["kind"],
+    actorId: row.actor_id,
+    detailSha256: row.detail_sha256,
+  };
 }
 
 function validateCredentialInput(input: {

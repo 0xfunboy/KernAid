@@ -71,6 +71,11 @@ import {
   type ServiceReceipt,
 } from "@kernaid/fleet-schemas";
 import { FleetControlPlane } from "../src/server.js";
+import {
+  ENTERPRISE_LICENSE_SCHEMA,
+  signEnterpriseLicense,
+  type EnterpriseLicenseClaims,
+} from "../src/enterprise-license.js";
 
 const ROOT_TOKEN = "root_" + "r".repeat(40);
 const INITIAL_TIME = Date.parse("2026-08-31T12:00:00.000Z");
@@ -89,6 +94,13 @@ const UPDATE_TRUST_ANCHOR = Buffer.from(
 const SERVICE_RECEIPT_ISSUER = generateKeyPairSync("ed25519");
 const SERVICE_RECEIPT_TRUST_ANCHOR = Buffer.from(
   SERVICE_RECEIPT_ISSUER.publicKey.export({ format: "der", type: "spki" }),
+)
+  .subarray(12)
+  .toString("base64url");
+const ENTERPRISE_LICENSE_ISSUER = generateKeyPairSync("ed25519");
+const ENTERPRISE_LICENSE_KEY_ID = "kernaid-commercial-test-2026";
+const ENTERPRISE_LICENSE_TRUST_ANCHOR = Buffer.from(
+  ENTERPRISE_LICENSE_ISSUER.publicKey.export({ format: "der", type: "spki" }),
 )
   .subarray(12)
   .toString("base64url");
@@ -139,6 +151,8 @@ async function createHarness(options?: {
   serviceReceiptSigningKey?: KeyObject;
   serviceReceiptTrustAnchor?: string;
   consoleSessionTtlMs?: number;
+  enterpriseLicenseTrustAnchor?: string;
+  enterpriseLicenseKeyId?: string;
 }): Promise<Harness> {
   const directory =
     options?.directory ?? mkdtempSync(join(tmpdir(), "kernaid-fleet-test-"));
@@ -154,6 +168,10 @@ async function createHarness(options?: {
     entitlementTrustAnchor:
       options?.entitlementTrustAnchor ?? ENTITLEMENT_TRUST_ANCHOR,
     updateTrustAnchor: options?.updateTrustAnchor ?? UPDATE_TRUST_ANCHOR,
+    enterpriseLicenseTrustAnchor:
+      options?.enterpriseLicenseTrustAnchor ?? ENTERPRISE_LICENSE_TRUST_ANCHOR,
+    enterpriseLicenseKeyId:
+      options?.enterpriseLicenseKeyId ?? ENTERPRISE_LICENSE_KEY_ID,
     now: () => new Date(now.value),
     consoleSessionTtlMs: options?.consoleSessionTtlMs,
     consoleDirectory: options?.consoleDirectory,
@@ -293,14 +311,75 @@ function verifiedServiceReceipt(
   return { receipt, canonical };
 }
 
-async function createTenant(harness: Harness): Promise<TenantCredentials> {
+async function createTenant(
+  harness: Harness,
+  licenseOverrides: Partial<EnterpriseLicenseClaims> | false = {},
+): Promise<TenantCredentials> {
   const result = await api(harness, "POST", "/v1/tenants", {}, ROOT_TOKEN);
   assert.equal(result.status, 201);
   assert.equal(typeof result.body.tenantId, "string");
   assert.equal(typeof result.body.adminToken, "string");
-  return {
+  const tenant = {
     tenantId: result.body.tenantId as string,
     adminToken: result.body.adminToken as string,
+  };
+  if (licenseOverrides !== false) {
+    const imported = await importTestEnterpriseLicense(
+      harness,
+      tenant,
+      licenseOverrides,
+    );
+    assert.equal(imported.status, 201);
+  }
+  return tenant;
+}
+
+async function importTestEnterpriseLicense(
+  harness: Harness,
+  tenant: TenantCredentials,
+  overrides: Partial<EnterpriseLicenseClaims> = {},
+): Promise<HttpResult> {
+  const claims = testEnterpriseLicenseClaims(harness, tenant, overrides);
+  return canonicalApi(
+    harness,
+    "POST",
+    "/v1/admin/enterprise-licenses/import",
+    signEnterpriseLicense(claims, ENTERPRISE_LICENSE_ISSUER.privateKey),
+    ROOT_TOKEN,
+  );
+}
+
+function testEnterpriseLicenseClaims(
+  harness: Harness,
+  tenant: TenantCredentials,
+  overrides: Partial<EnterpriseLicenseClaims> = {},
+): EnterpriseLicenseClaims {
+  const nowUnix = Math.floor(harness.now.value / 1_000);
+  return {
+    schema: ENTERPRISE_LICENSE_SCHEMA,
+    version: 1,
+    licenseId: `license_${tenant.tenantId}`,
+    sequence: 1,
+    keyId: ENTERPRISE_LICENSE_KEY_ID,
+    plan: "enterprise",
+    features: [
+      "device_management",
+      "entitlements",
+      "incidents",
+      "policy",
+      "remote_diagnosis",
+      "remote_repair",
+      "technician_seats",
+      "updates",
+    ],
+    deviceLimit: 100,
+    seatLimit: 100,
+    issuedAtUnix: nowUnix,
+    notBeforeUnix: nowUnix,
+    expiresAtUnix: nowUnix + 7 * 86_400,
+    graceUntilUnix: nowUnix + 14 * 86_400,
+    ...overrides,
+    tenantId: tenant.tenantId,
   };
 }
 
@@ -899,6 +978,281 @@ test("root and tenant administration are strictly isolated", async () => {
   }
 });
 
+test("offline enterprise license gates mutations, enforces seats, and preserves ingestion", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness, false);
+    const missing = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/enterprise-license`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(missing.status, 200);
+    assert.equal(missing.body.state, "missing");
+    const blocked = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/enrollment-tokens`,
+      { expiresInSeconds: 300 },
+      tenant.adminToken,
+    );
+    assert.equal(blocked.status, 403);
+    assert.equal(blocked.body.error, "enterprise_license_required");
+
+    const validClaims = testEnterpriseLicenseClaims(harness, tenant, {
+      deviceLimit: 1,
+      seatLimit: 1,
+    });
+    const validEnvelope = signEnterpriseLicense(
+      validClaims,
+      ENTERPRISE_LICENSE_ISSUER.privateKey,
+    );
+    const tampered = {
+      ...validEnvelope,
+      claims: { ...validEnvelope.claims, deviceLimit: 2 },
+    };
+    assert.equal(
+      (
+        await canonicalApi(
+          harness,
+          "POST",
+          "/v1/admin/enterprise-licenses/import",
+          tampered,
+          ROOT_TOKEN,
+        )
+      ).status,
+      401,
+    );
+    const imported = await canonicalApi(
+      harness,
+      "POST",
+      "/v1/admin/enterprise-licenses/import",
+      validEnvelope,
+      ROOT_TOKEN,
+    );
+    assert.equal(imported.status, 201);
+    assert.equal(imported.body.state, "active");
+
+    const firstOperator = await createAccessCredential(
+      harness,
+      tenant,
+      "operator",
+      "Primary operator",
+    );
+    const overSeat = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/access-credentials`,
+      { role: "operator", label: "Over limit" },
+      tenant.adminToken,
+    );
+    assert.equal(overSeat.status, 409);
+    assert.equal(overSeat.body.error, "enterprise_seat_limit_reached");
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/access-credentials/${firstOperator.credentialId}/revoke`,
+          {},
+          tenant.adminToken,
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/access-credentials`,
+          { role: "operator", label: "Replacement operator" },
+          tenant.adminToken,
+        )
+      ).status,
+      201,
+    );
+
+    const firstDevice = await enroll(harness, tenant, "licensed-device");
+    const secondToken = await createEnrollmentToken(harness, tenant);
+    const secondDevice = makeDevice("replacement-device");
+    const secondEnrollment = signedEnrollment(
+      harness,
+      tenant,
+      secondToken,
+      secondDevice,
+    );
+    const deviceOverSeat = await api(
+      harness,
+      "POST",
+      "/v1/enrollments",
+      secondEnrollment,
+    );
+    assert.equal(deviceOverSeat.status, 409);
+    assert.equal(deviceOverSeat.body.error, "enterprise_seat_limit_reached");
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/devices/${firstDevice.deviceId}/revoke`,
+          {},
+          tenant.adminToken,
+        )
+      ).status,
+      200,
+    );
+    assert.equal(
+      (await api(harness, "POST", "/v1/enrollments", secondEnrollment)).status,
+      201,
+    );
+
+    const revoked = await api(
+      harness,
+      "POST",
+      "/v1/admin/enterprise-licenses/revoke",
+      { tenantId: tenant.tenantId, licenseId: validClaims.licenseId },
+      ROOT_TOKEN,
+    );
+    assert.equal(revoked.status, 200);
+    assert.equal(revoked.body.state, "revoked");
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/enrollment-tokens`,
+          { expiresInSeconds: 300 },
+          tenant.adminToken,
+        )
+      ).status,
+      403,
+    );
+    assert.equal(
+      (
+        await api(
+          harness,
+          "GET",
+          `/v1/tenants/${tenant.tenantId}/devices`,
+          undefined,
+          tenant.adminToken,
+        )
+      ).status,
+      200,
+    );
+    const inventory = signedInventory(
+      harness,
+      tenant,
+      secondDevice,
+      1,
+      asset("licensed-history"),
+    );
+    assert.equal(
+      (await api(harness, "POST", "/v1/inventories", inventory)).status,
+      201,
+    );
+    const status = await api(
+      harness,
+      "GET",
+      `/v1/tenants/${tenant.tenantId}/enterprise-license`,
+      undefined,
+      tenant.adminToken,
+    );
+    assert.equal(status.body.state, "revoked");
+    assert.equal(
+      (status.body.events as Array<Record<string, unknown>>).some(
+        (event) => event.kind === "seat_revoked",
+      ),
+      true,
+    );
+    assert.doesNotMatch(JSON.stringify(status.body), /private|seed|token/i);
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("enterprise grace, expiry, and wall-clock rollback fail closed", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness, false);
+    const nowUnix = Math.floor(harness.now.value / 1_000);
+    const grace = await importTestEnterpriseLicense(harness, tenant, {
+      issuedAtUnix: nowUnix - 300,
+      notBeforeUnix: nowUnix - 300,
+      expiresAtUnix: nowUnix - 1,
+      graceUntilUnix: nowUnix + 300,
+    });
+    assert.equal(grace.status, 201);
+    assert.equal(grace.body.state, "grace");
+    const blockedInGrace = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/enrollment-tokens`,
+      { expiresInSeconds: 300 },
+      tenant.adminToken,
+    );
+    assert.equal(blockedInGrace.body.error, "enterprise_license_grace");
+
+    assert.equal(
+      (
+        await importTestEnterpriseLicense(harness, tenant, {
+          sequence: 2,
+          licenseId: "license_active_renewal",
+        })
+      ).status,
+      201,
+    );
+    harness.now.value += 600_000;
+    assert.equal(
+      (
+        await api(
+          harness,
+          "GET",
+          `/v1/admin/enterprise-licenses/${tenant.tenantId}`,
+          undefined,
+          ROOT_TOKEN,
+        )
+      ).body.state,
+      "active",
+    );
+    harness.now.value -= 601_000;
+    const rollback = await api(
+      harness,
+      "GET",
+      `/v1/admin/enterprise-licenses/${tenant.tenantId}`,
+      undefined,
+      ROOT_TOKEN,
+    );
+    assert.equal(rollback.body.state, "clock_rollback");
+    assert.equal(
+      (
+        await api(
+          harness,
+          "POST",
+          `/v1/tenants/${tenant.tenantId}/enrollment-tokens`,
+          { expiresInSeconds: 300 },
+          tenant.adminToken,
+        )
+      ).body.error,
+      "enterprise_license_clock_rollback",
+    );
+    harness.now.value += 601_000;
+    harness.now.value += 15 * 86_400_000;
+    const expired = await api(
+      harness,
+      "GET",
+      `/v1/admin/enterprise-licenses/${tenant.tenantId}`,
+      undefined,
+      ROOT_TOKEN,
+    );
+    assert.equal(expired.body.state, "expired");
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
 test("tenant admin and operator roles enforce least privilege with access audit", async () => {
   const harness = await createHarness();
   try {
@@ -1462,7 +1816,7 @@ test("console login is exact, tenant-bound, and rate limited with bounded state"
   }
 });
 
-test("SQLite v6 migrates its tenant administrator through Fleet v10", async () => {
+test("SQLite v6 migrates its tenant administrator through Fleet v11", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -1471,6 +1825,10 @@ test("SQLite v6 migrates its tenant administrator through Fleet v10", async () =
     await destroyHarness(harness, false);
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE enterprise_license_events;
+      DROP TABLE enterprise_license_clock;
+      DROP TABLE enterprise_license_seats;
+      DROP TABLE enterprise_licenses;
       DROP TABLE incident_case_events;
       DROP TABLE incident_case_work_orders;
       DROP TABLE incident_cases;
@@ -1500,7 +1858,7 @@ test("SQLite v6 migrates its tenant administrator through Fleet v10", async () =
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 10);
+    assert.equal(version.user_version, 11);
     database.close();
   } finally {
     await destroyHarness(harness);
@@ -1800,6 +2158,8 @@ test("service receipt key mismatch and database anchor change fail at startup", 
         serviceReceiptTrustAnchor: SERVICE_RECEIPT_TRUST_ANCHOR,
         entitlementTrustAnchor: ENTITLEMENT_TRUST_ANCHOR,
         updateTrustAnchor: UPDATE_TRUST_ANCHOR,
+        enterpriseLicenseTrustAnchor: ENTERPRISE_LICENSE_TRUST_ANCHOR,
+        enterpriseLicenseKeyId: ENTERPRISE_LICENSE_KEY_ID,
       }),
     /matching Ed25519 pair/,
   );
@@ -2611,6 +2971,10 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE enterprise_license_events;
+      DROP TABLE enterprise_license_clock;
+      DROP TABLE enterprise_license_seats;
+      DROP TABLE enterprise_licenses;
       DROP TABLE incident_case_events;
       DROP TABLE incident_case_work_orders;
       DROP TABLE incident_cases;
@@ -2636,6 +3000,10 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     `);
     legacy.close();
     harness = await createHarness({ directory, now });
+    assert.equal(
+      (await importTestEnterpriseLicense(harness, tenant)).status,
+      201,
+    );
 
     assert.equal((await setPolicyAnchor(harness, tenant, signer)).status, 201);
     const bundle = signedPolicy(tenant, signer, {
@@ -2666,7 +3034,7 @@ test("policy anchor, bundle, and assignment survive SQLite restart", async () =>
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 10);
+    assert.equal(version.user_version, 11);
     const nonce = database
       .prepare(
         `SELECT nonce_sha256 FROM policy_pull_nonces
@@ -2969,7 +3337,7 @@ test("signed entitlement pulls isolate assignments and reject replay, key mismat
   }
 });
 
-test("SQLite v3 migrates through v10 and entitlement checkpoints survive restart", async () => {
+test("SQLite v3 migrates through v11 and entitlement checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -2984,6 +3352,10 @@ test("SQLite v3 migrates through v10 and entitlement checkpoints survive restart
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE enterprise_license_events;
+      DROP TABLE enterprise_license_clock;
+      DROP TABLE enterprise_license_seats;
+      DROP TABLE enterprise_licenses;
       DROP TABLE incident_case_events;
       DROP TABLE incident_case_work_orders;
       DROP TABLE incident_cases;
@@ -3005,6 +3377,10 @@ test("SQLite v3 migrates through v10 and entitlement checkpoints survive restart
     `);
     legacy.close();
     harness = await createHarness({ directory, now });
+    assert.equal(
+      (await importTestEnterpriseLicense(harness, tenant)).status,
+      201,
+    );
 
     const entitlement = signedEntitlement(tenant, [device.deviceId], {
       entitlementId: "persistent_entitlement",
@@ -3040,7 +3416,7 @@ test("SQLite v3 migrates through v10 and entitlement checkpoints survive restart
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 10);
+    assert.equal(version.user_version, 11);
     const document = database
       .prepare(
         `SELECT highest_sequence, envelope_sha256, canonical_json
@@ -3266,7 +3642,7 @@ test("signed update pulls bind target and ring, filter eligibility, and reject r
   }
 });
 
-test("SQLite v4 migrates through v10 and update checkpoints survive restart", async () => {
+test("SQLite v4 migrates through v11 and update checkpoints survive restart", async () => {
   let harness = await createHarness();
   const directory = harness.directory;
   const now = harness.now;
@@ -3277,6 +3653,10 @@ test("SQLite v4 migrates through v10 and update checkpoints survive restart", as
 
     const legacy = new DatabaseSync(harness.databasePath);
     legacy.exec(`
+      DROP TABLE enterprise_license_events;
+      DROP TABLE enterprise_license_clock;
+      DROP TABLE enterprise_license_seats;
+      DROP TABLE enterprise_licenses;
       DROP TABLE incident_case_events;
       DROP TABLE incident_case_work_orders;
       DROP TABLE incident_cases;
@@ -3295,6 +3675,10 @@ test("SQLite v4 migrates through v10 and update checkpoints survive restart", as
     `);
     legacy.close();
     harness = await createHarness({ directory, now });
+    assert.equal(
+      (await importTestEnterpriseLicense(harness, tenant)).status,
+      201,
+    );
     const manifest = signedUpdateManifest({ sequence: 7 });
     assert.equal(
       (await publishUpdateManifest(harness, tenant, manifest)).status,
@@ -3312,7 +3696,7 @@ test("SQLite v4 migrates through v10 and update checkpoints survive restart", as
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 10);
+    assert.equal(version.user_version, 11);
     const checkpoint = database
       .prepare(
         `SELECT highest_sequence, manifest_sha256
@@ -3450,6 +3834,62 @@ test("tenant governance status is bounded, minimized, and admin-scoped", async (
       ).status,
       401,
     );
+  } finally {
+    await destroyHarness(harness);
+  }
+});
+
+test("Windows P0 diagnosis remains a closed typed Fleet work order", async () => {
+  const harness = await createHarness();
+  try {
+    const tenant = await createTenant(harness);
+    const device = await enroll(harness, tenant, "windows-device", "windows");
+    const signer = makePolicySigner();
+    assert.equal((await setPolicyAnchor(harness, tenant, signer)).status, 201);
+    assert.equal(
+      (
+        await publishPolicy(
+          harness,
+          tenant,
+          signedPolicy(tenant, signer, {
+            policyId: "windows-p0",
+            revision: 1,
+            assignments: { deviceIds: [device.deviceId] },
+            allowedActionIds: ["windows.p0.diagnose.v1"],
+          }),
+        )
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
+        await publishEntitlement(
+          harness,
+          tenant,
+          signedEntitlement(tenant, [device.deviceId], {
+            entitlementId: "windows_p0_license",
+            sequence: 1,
+          }),
+        )
+      ).status,
+      201,
+    );
+    const created = await api(
+      harness,
+      "POST",
+      `/v1/tenants/${tenant.tenantId}/work-orders`,
+      {
+        requestId: "windows-p0-request",
+        targetDeviceId: device.deviceId,
+        actionId: "windows.p0.diagnose.v1",
+        actionVersion: 1,
+        expiresAt: new Date(harness.now.value + 600_000).toISOString(),
+      },
+      tenant.adminToken,
+    );
+    assert.equal(created.status, 201);
+    assert.equal(created.body.kind, "diagnosis");
+    assert.equal(created.body.actionId, "windows.p0.diagnose.v1");
   } finally {
     await destroyHarness(harness);
   }
@@ -3924,7 +4364,7 @@ test("work-order cancellation, expiry, and audit survive restart", async () => {
     const version = database.prepare("PRAGMA user_version").get() as {
       user_version: number;
     };
-    assert.equal(version.user_version, 10);
+    assert.equal(version.user_version, 11);
     database.close();
   } finally {
     await destroyHarness(harness);

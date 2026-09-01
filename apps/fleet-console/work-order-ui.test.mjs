@@ -73,6 +73,21 @@ test("readiness, actions, receipt labels, and minimized response are fail closed
     }).canSubmit,
     false,
   );
+  assert.deepEqual(
+    workOrderActionsForPlatform("windows").map((action) => action.actionId),
+    ["windows.p0.diagnose.v1"],
+  );
+  assert.equal(
+    createWorkOrderPayload({
+      requestId: "ui_windows_diagnosis",
+      targetDeviceId: deviceId,
+      platform: "windows",
+      actionId: "windows.p0.diagnose.v1",
+      lifetimeSeconds: 600,
+      nowMs: Date.parse("2026-08-31T18:00:00Z"),
+    }).actionId,
+    "windows.p0.diagnose.v1",
+  );
   assert.deepEqual(workOrderControls({ status: "pending_approval" }), {
     canApprove: true,
     canCancel: true,
