@@ -200,3 +200,7 @@ See [Current status](docs/CURRENT_STATUS.md), the [operator guide](docs/operator
   Boot, physical-machine validation and actual repair actions remain release
   gates.
 - Desktop artifacts are unsigned engineering previews.
+
+## Licensing
+
+Licensing scope and preserved third-party permissions are documented in [LICENSING.md](LICENSING.md). The [0xfunboy Non-Commercial License](LICENSE.md) covers eligible original material only.
