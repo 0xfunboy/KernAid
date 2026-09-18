@@ -31,6 +31,7 @@ on:
       - "crates/storage/**"
       - "crates/device-identity/**"
       - "services/agent-gateway/**"
+      - "services/rescue-assistant/**"
       - "packages/provider-types/**"
       - "packages/schemas/**"
       - "packages/session-driver/**"
@@ -295,6 +296,8 @@ jobs:
             "$preflight_dir/kernaid-codex-auth"
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             --profile tauri-webkit "$preflight_dir/kernaid-rescue-desk-shell"
+      - name: Stage pinned Pi assistant and local SearXNG
+        run: bash tools/build-rescue/stage-assistant.sh
       - name: Build hybrid BIOS and UEFI ISO
         run: |
           docker run --rm --privileged \

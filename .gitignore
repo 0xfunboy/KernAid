@@ -4,6 +4,10 @@
 apps/desk/src-tauri/gen/schemas/
 apps/desk/src-tauri-rescue/gen/schemas/
 rescue/live-build/config/includes.chroot/opt/kernaid/desk/
+rescue/live-build/config/includes.chroot/opt/kernaid/assistant/
+rescue/live-build/config/includes.chroot/opt/kernaid/searxng-source/
+rescue/live-build/config/includes.chroot/etc/kernaid-assistant/gemrouter.key
+rescue/live-build/config/includes.chroot/etc/systemd/system/kernaid-assistant.service.d/50-private-credential.conf
 **/__pycache__/
 *.pyc
 *.log

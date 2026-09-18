@@ -233,6 +233,12 @@ cleanup_staged_binaries() {
 }
 trap cleanup_staged_binaries EXIT
 
+# Node/pnpm run on the build host, before the minimal Debian build container.
+# Fail closed if the assistant bundle was not staged by the pinned workflow.
+test -f "$build_dir/config/includes.chroot/opt/kernaid/assistant/server.mjs"
+test -f "$build_dir/config/includes.chroot/opt/kernaid/searxng-source/setup.py"
+test "$("$build_dir/config/includes.chroot/opt/kernaid/assistant/node" --version)" = v24.18.0
+
 [[ -d "$vaultd_destination_dir" && ! -L "$vaultd_destination_dir" ]] || {
   echo "Rescue daemon staging directory is missing or unsafe" >&2
   exit 2

@@ -1,0 +1,28 @@
+[Unit]
+Description=KernAid private SearXNG search
+After=network.target systemd-sysusers.service
+
+[Service]
+User=kernaid-search
+Group=kernaid-search
+Environment=SEARXNG_SETTINGS_PATH=/etc/kernaid-assistant/searxng.yml
+Environment=SEARXNG_SECRET=kernaid-local-loopback-search-no-sessions
+Environment=SEARXNG_LIMITER=false
+Environment=HOME=/run/kernaid-search
+Environment=XDG_CACHE_HOME=/run/kernaid-search
+RuntimeDirectory=kernaid-search
+WorkingDirectory=/opt/kernaid/searxng-source
+ExecStart=/opt/kernaid/searxng/bin/waitress-serve --listen=127.0.0.1:8888 --threads=4 searx.webapp:application
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

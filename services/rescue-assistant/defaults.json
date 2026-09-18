@@ -1,0 +1,31 @@
+{
+  "defaultSurface": "gemrouter",
+  "surfaces": {
+    "gemrouter": {
+      "label": "Gemrouter",
+      "baseUrl": "https://gemr.airewardrop.xyz",
+      "model": "gemini-3.8-flash",
+      "nativeTools": false
+    },
+    "openai": {
+      "label": "OpenAI",
+      "baseUrl": "https://api.openai.com/v1",
+      "model": ""
+    },
+    "deepseek": {
+      "label": "DeepSeek",
+      "baseUrl": "https://api.deepseek.com",
+      "model": "deepseek-chat"
+    },
+    "gemini": {
+      "label": "Gemini",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "model": ""
+    },
+    "custom": {
+      "label": "OpenAI-compatible endpoint",
+      "baseUrl": "",
+      "model": ""
+    }
+  }
+}

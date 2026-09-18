@@ -1,0 +1,10 @@
+// Only the fixed local wizard service can configure live networking.
+// The Pi tool allowlist contains web_search only; it cannot invoke nmcli.
+polkit.addRule(function(action, subject) {
+    if (subject.user === "kernaid-assistant" && [
+        "org.freedesktop.NetworkManager.network-control",
+        "org.freedesktop.NetworkManager.wifi.scan",
+        "org.freedesktop.NetworkManager.enable-disable-wifi",
+        "org.freedesktop.NetworkManager.settings.modify.own"
+    ].indexOf(action.id) !== -1) return polkit.Result.YES;
+});

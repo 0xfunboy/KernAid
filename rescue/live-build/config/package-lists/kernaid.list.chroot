@@ -12,6 +12,14 @@ xserver-xorg
 lightdm
 xauth
 network-manager
+wpasupplicant
+firmware-iwlwifi
+firmware-realtek
+firmware-atheros
+firmware-brcm80211
+polkitd
+python3-venv
+git
 iproute2
 libwebkit2gtk-4.1-0
 xdotool

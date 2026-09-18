@@ -1,0 +1,23 @@
+use_default_settings:
+  engines:
+    keep_only:
+      - duckduckgo
+      - google
+      - bing
+      - brave
+      - wikipedia
+general:
+  instance_name: KernAid Search
+  enable_metrics: false
+search:
+  formats: [json]
+  autocomplete: ''
+server:
+  bind_address: 127.0.0.1
+  port: 8888
+  limiter: false
+  image_proxy: false
+  secret_key: kernaid-local-loopback-search-no-sessions
+outgoing:
+  request_timeout: 8.0
+  max_request_timeout: 12.0

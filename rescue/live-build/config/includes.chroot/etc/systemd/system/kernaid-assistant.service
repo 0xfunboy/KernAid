@@ -1,0 +1,31 @@
+[Unit]
+Description=KernAid connection wizard and Pi assistant
+After=NetworkManager.service systemd-sysusers.service
+Wants=NetworkManager.service kernaid-search.service
+
+[Service]
+User=kernaid-assistant
+Group=kernaid-assistant
+RuntimeDirectory=kernaid-assistant
+RuntimeDirectoryMode=0750
+UMask=0007
+WorkingDirectory=/opt/kernaid/assistant
+ExecStart=/opt/kernaid/assistant/node server.mjs
+Environment=HOME=/run/kernaid-assistant/state
+Environment=KERNAID_ASSISTANT_SOCKET=/run/kernaid-assistant/assistant.sock
+Environment=KERNAID_ASSISTANT_STATE=/run/kernaid-assistant/state
+Environment=KERNAID_SEARCH_URL=http://127.0.0.1:8888/search
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

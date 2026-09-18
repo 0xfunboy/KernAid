@@ -1,5 +1,8 @@
 # KernAid workshop operator guide
 
+The 18 September source adds a network-first Pi/Gemrouter wizard. It still
+needs a new qualified ISO; see [setup, key rotation and limitations](RESCUE_NETWORK_FIRST.md).
+
 This guide describes the intended engineering-preview workflow. KernAid must
 not be represented as supporting physical Rescue media, Secure Boot or
 unattended repair until those release gates are completed.

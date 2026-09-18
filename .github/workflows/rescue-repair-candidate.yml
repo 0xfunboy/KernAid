@@ -157,6 +157,8 @@ jobs:
             --features rescue-fleet-service \
             --bin kernaid-fleet-rescue-repair-bridge
 
+      - name: Stage pinned Pi assistant and local SearXNG
+        run: bash tools/build-rescue/stage-assistant.sh
       - name: Build isolated repair candidate ISO
         run: |
           docker run --rm --privileged \

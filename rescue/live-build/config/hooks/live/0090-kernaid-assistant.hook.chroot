@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+# Pinned SearXNG source is staged before live-build, preserving its AGPL license.
+test -f /opt/kernaid/searxng-source/setup.py
+# Staging happens as the unprivileged CI user; shipping code/config is root-owned.
+chown -R root:root /opt/kernaid/assistant /opt/kernaid/searxng-source
+chown root:root /etc/kernaid-assistant/searxng.yml \
+    /etc/polkit-1/rules.d/40-kernaid-network.rules \
+    /etc/sysusers.d/kernaid-assistant.conf \
+    /etc/systemd/system/kernaid-assistant.service \
+    /etc/systemd/system/kernaid-search.service \
+    /etc/systemd/system/kernaid-ui.service.d/40-kernaid-assistant.conf
+if [ -f /etc/kernaid-assistant/gemrouter.key ]; then
+    chown root:root /etc/kernaid-assistant/gemrouter.key \
+        /etc/systemd/system/kernaid-assistant.service.d/50-private-credential.conf
+    chmod 0600 /etc/kernaid-assistant/gemrouter.key
+fi
+python3 -m venv /opt/kernaid/searxng
+/opt/kernaid/searxng/bin/pip install --disable-pip-version-check --no-cache-dir \
+    setuptools==80.9.0 wheel==0.45.1 waitress==3.0.2 \
+    -r /opt/kernaid/searxng-source/requirements.txt
+/opt/kernaid/searxng/bin/pip install --disable-pip-version-check --no-cache-dir \
+    --no-build-isolation /opt/kernaid/searxng-source
+test "$(/opt/kernaid/assistant/node --version)" = v24.18.0
+systemctl enable kernaid-assistant.service kernaid-search.service

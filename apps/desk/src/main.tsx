@@ -105,6 +105,7 @@ import {
 } from "./rescue-ui";
 import { FixtureRepairLabPanel } from "./fixture-repair-lab-panel";
 import { RescueDiagnosisWizard } from "./rescue-diagnosis-wizard";
+import { RescueConnectionWizard } from "./rescue-connection-wizard";
 import { RescueRepairPanel } from "./rescue-repair-entry";
 import "./style.css";
 
@@ -114,6 +115,7 @@ const RESCUE_OPENAI_STATUS_ATTEMPTS = 20;
 const RESCUE_OPENAI_STATUS_RETRY_MS = 250;
 
 function App() {
+  const [connectionReady, setConnectionReady] = useState(!isRescueRuntime());
   const [driver, setDriver] = useState<LocalSessionDriver>();
   const [rescueAuditSink, setRescueAuditSink] = useState<RescueAuditSink>();
   const [runtimeStatus, setRuntimeStatus] = useState<SecureRuntimeStatus>();
@@ -319,7 +321,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!isRescueRuntime() || !inventoryReady) return;
+    if (!isRescueRuntime() || !connectionReady || !inventoryReady) return;
     let cancelled = false;
     const operationEpoch = ++rescueContextEpoch.current;
     setRescueTargetBusy(true);
@@ -355,10 +357,10 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [inventoryReady]);
+  }, [inventoryReady, connectionReady]);
 
   useEffect(() => {
-    if (!hasLocalCollector()) return;
+    if (!hasLocalCollector() || !connectionReady) return;
     collectLocalInventory()
       .then((items) => {
         setNativeEvidence(items);
@@ -371,7 +373,7 @@ function App() {
         setStatus(message);
       })
       .finally(() => setInventoryReady(true));
-  }, []);
+  }, [connectionReady]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1295,7 +1297,21 @@ function App() {
   }
 
   return (
-    <main>
+    <main
+      className={
+        isRescueRuntime()
+          ? connectionReady
+            ? "rescue-connected"
+            : "rescue-connecting"
+          : undefined
+      }
+    >
+      {isRescueRuntime() && (
+        <RescueConnectionWizard
+          ready={connectionReady}
+          onReady={() => setConnectionReady(true)}
+        />
+      )}
       <header>
         <strong>KernAid</strong>
         <div className="runtime-summary">

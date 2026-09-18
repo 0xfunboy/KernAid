@@ -1,6 +1,13 @@
 # KernAid current status
 
-Last updated: 1 September 2026
+Last updated: 18 September 2026
+
+New source checkpoint: Rescue starts with network setup and a Pi assistant
+using Gemrouter `gemini-3.8-flash`, selectable compatible providers and local
+SearXNG search. This change is not in a newly qualified ISO. Existing release
+evidence below is the 1 September checkpoint. See
+[network-first implementation and verification](RESCUE_NETWORK_FIRST.md) for
+the new behavior, router limitation and remaining physical test gates.
 
 This page separates the product vision from what the repository can safely do
 today. The short version is: **the stable customer image is still a

@@ -140,6 +140,16 @@ export function RescueDiagnosisWizard({
   const nativePromptEpoch = useRef(0);
   const nativePromptInFlight = useRef(false);
   const nativePromptShortcutPending = useRef(false);
+  const providerStep = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (selectedTarget !== undefined) {
+      providerStep.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+      providerStep.current?.focus({ preventScroll: true });
+    }
+  }, [selectedTarget]);
   const reportReady = report !== undefined && sessionId !== undefined;
   const progress = rescueDiagnosisWizardProgress({
     vaultStatusReady,
@@ -165,7 +175,11 @@ export function RescueDiagnosisWizard({
     nativePromptEpoch.current = epoch;
     async function readStatus() {
       let lastStatus: RescueNativePromptStatus | undefined;
-      for (let attempt = 0; attempt < NATIVE_PROMPT_STATUS_ATTEMPTS; attempt += 1) {
+      for (
+        let attempt = 0;
+        attempt < NATIVE_PROMPT_STATUS_ATTEMPTS;
+        attempt += 1
+      ) {
         try {
           lastStatus = await getRescueNativePromptStatus();
           if (lastStatus.availability === "available") break;
@@ -254,7 +268,8 @@ export function RescueDiagnosisWizard({
       }
     };
     globalThis.addEventListener("keydown", handleShortcut, true);
-    return () => globalThis.removeEventListener("keydown", handleShortcut, true);
+    return () =>
+      globalThis.removeEventListener("keydown", handleShortcut, true);
   }, [persistentAuditReady, vaultUnlockEligible, nativePromptStatus]);
 
   useEffect(() => {
@@ -435,6 +450,8 @@ export function RescueDiagnosisWizard({
 
       <div
         className={`rescue-wizard-card ${progress.provider}`}
+        ref={providerStep}
+        tabIndex={-1}
         aria-current={progress.provider === "current" ? "step" : undefined}
       >
         <WizardCardTitle

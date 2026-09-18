@@ -4283,6 +4283,44 @@ class RescueHandler(SimpleHTTPRequestHandler):
             self._send_application_failure(error)
         return True
 
+    def _handle_assistant(self) -> None:
+        """Relay only local, explicitly submitted wizard operations."""
+        origins = self.headers.get_all("Origin", [])
+        hosts = self.headers.get_all("Host", [])
+        if (not self.local_authority() or not self.same_site_request()
+                or len(hosts) != 1 or origins != [f"http://{hosts[0]}"]
+                or self.headers.get("Content-Type") != "application/json"
+                or self.headers.get("Transfer-Encoding") is not None):
+            self.send_error(403)
+            return
+        self._arm_request_deadline(80)
+        try:
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) != 1 or not lengths[0].isdigit():
+                raise ValueError()
+            size = int(lengths[0])
+            if not 0 < size <= 16 * 1024:
+                raise ValueError()
+            request = json.loads(self.rfile.read(size))
+            if not isinstance(request, dict) or request.get("action") not in {
+                "status", "networks", "wifi", "connect", "configure", "models", "chat"
+            }:
+                raise ValueError()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+                peer.settimeout(72)
+                peer.connect("/run/kernaid-assistant/assistant.sock")
+                peer.sendall(json.dumps(request).encode() + b"\n")
+                chunks = bytearray()
+                while b"\n" not in chunks:
+                    chunk = peer.recv(4096)
+                    if not chunk or len(chunks) + len(chunk) > 64 * 1024:
+                        raise ValueError()
+                    chunks.extend(chunk)
+                response = json.loads(chunks)
+            self._send_application_json(200, response)
+        except (ValueError, OSError):
+            self._send_application_json(503, {"ok": False, "error": "Connection assistant unavailable. Retry or continue offline."})
+
     def do_GET(self) -> None:
         if not self.local_authority():
             self.send_error(421)
@@ -4344,6 +4382,9 @@ class RescueHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self) -> None:
+        if self.path == "/api/rescue/assistant":
+            self._handle_assistant()
+            return
         if self._handle_application_post():
             return
         # KERNAID_REPAIR_CANDIDATE_BEGIN
