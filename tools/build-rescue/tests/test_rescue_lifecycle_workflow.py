@@ -268,7 +268,10 @@ class RescueLifecycleWorkflowTests(unittest.TestCase):
 
     def test_qualified_release_is_a_same_run_fail_closed_final_job(self) -> None:
         qualified = job_block(self.workflow, "qualified-release")
-        self.assertIn("    if: github.ref == 'refs/heads/main'\n", qualified)
+        self.assertIn(
+            "    if: github.ref == 'refs/heads/main' && !inputs.private_testing\n",
+            qualified,
+        )
         for dependency in (
             "build-and-smoke-test",
             "native-vault-prompt-bios",

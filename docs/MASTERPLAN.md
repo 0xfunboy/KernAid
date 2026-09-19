@@ -32,10 +32,13 @@ and select target disks. Fix the reported first-use stall before widening the
 repair catalog. Cloud availability is not assumed and cannot block offline
 diagnosis. A conversational assistant is not yet an autonomous repair engine.
 
-**19 September continuation:** the `53afa5a` ISO was built and passed QEMU BIOS
-smoke, including assistant readiness; the remaining release jobs are running
-or pending. The source batch through `f464b5a` adds a review-and-consent path for a minimal inspection summary
-to Pi; it is not part of that running image. The current-schema Enterprise
+**19 September continuation:** the `53afa5a` ISO passed its complete base build,
+BIOS/UEFI Secure Boot and USB-style two-boot matrix, including assistant
+readiness. Its separate Vault BIOS/UEFI lifecycle jobs timed out at
+`firstboot-confirmation`; the native Vault prompt job timed out at
+`firstboot-result`. It was not promoted. The source batch through `ec86f5f`
+adds the consented inspection summary and verified Gemini-backed Pi transport;
+it is not part of that earlier image. The current-schema Enterprise
 offline backup/restore gate is now verified against a real signed v13 bundle
 without changing the live database. Readiness failures now have closed static
 diagnostic codes for the next image; the old Vault root cause remains unknown
@@ -1072,6 +1075,10 @@ The order below replaces the original calendar-based phase estimates.
 - Preserve the explicit offline path; never infer target selection or consent.
 - Prove the new services start in the shipped image. Keep public artifacts
   free of provider keys; private test credentials remain outside Git.
+- Standing owner decision: private testing ISOs include the configured
+  Gemrouter test credential. The dedicated private-testing build packages it
+  without exposing plaintext images through public CI artifacts. Publish the
+  reviewed result only in the authenticated site; public releases stay keyless.
 - Publish only reviewed artifact bytes/hash/provenance, clearly distinguishing
   a physical-test download from a promoted stable release.
 - Obtain one owner physical check: boot on the previously affected Intel PC,

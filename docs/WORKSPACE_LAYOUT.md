@@ -10,7 +10,7 @@ integration branches as a release or as a second source of product status.
 | `/home/funboy/.local/share/kernaid-archive/2026-09-19` | Retained historical probes, logs and forensic image; not a release           |
 | `/home/funboy/.local/share/kernaid-search`             | Active local SearXNG runtime; retain                                         |
 | `/home/funboy/.config/kaid-site`                       | Private website credentials; never commit                                    |
-| `/home/funboy/.config/kernaid-assistant`               | Private development provider credential; never commit or publish in an image |
+| `/home/funboy/.config/kernaid-assistant`               | Private runtime/build credentials; never commit or include in public images. The owner-authorized test credential is bundled only in private testing ISOs. |
 | `/home/funboy/KERNAID_PRODUCT_AND_REPO_MASTERPLAN.md`  | Compatibility pointer to `docs/MASTERPLAN.md`, not another plan              |
 
 ## Integrated worktrees

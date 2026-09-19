@@ -163,8 +163,11 @@ NetworkManager control, Wi-Fi scan and live-system profile changes (the daemon
 has no login session for private profiles). The UI's group-restricted relay checks
 Origin/Host and bounds request sizes and timeouts.
 
-Public images ask for a key. For preconfigured **private test media**, supply
-the private file explicitly during staging:
+Public images ask for a key. The owner-authorized private-testing CI path
+bundles the configured test credential and publishes only an encrypted
+artifact for internal distribution. See the [private ISO runbook](runbooks/private-test-iso.md).
+For a local preconfigured **private test build**, supply the private file
+explicitly during staging:
 
 ```sh
 KERNAID_PRIVATE_GEMROUTER_KEY_FILE=/home/funboy/.config/kernaid-assistant/gemrouter.key \

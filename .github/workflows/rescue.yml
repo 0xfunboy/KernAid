@@ -1,6 +1,11 @@
 name: rescue
 on:
   workflow_dispatch:
+    inputs:
+      private_testing:
+        description: Bundle the test credential; publish only an encrypted, unqualified testing ISO
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -45,14 +50,23 @@ on:
       - ".github/workflows/rescue.yml"
 permissions: { contents: read }
 concurrency:
-  group: rescue-${{ github.event_name }}-${{ github.ref }}
+  group: rescue-${{ github.event_name }}-${{ github.ref }}-${{ inputs.private_testing || false }}
   cancel-in-progress: true
 jobs:
   build-and-smoke-test:
+    if: ${{ !inputs.private_testing || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 155
     steps:
       - uses: actions/checkout@v4
+      - name: Validate private testing secrets
+        if: inputs.private_testing
+        env:
+          KERNAID_TEST_GEMROUTER_KEY: ${{ secrets.KERNAID_TEST_GEMROUTER_KEY }}
+          KERNAID_TEST_ISO_PASSPHRASE: ${{ secrets.KERNAID_TEST_ISO_PASSPHRASE }}
+        run: |
+          test -n "$KERNAID_TEST_GEMROUTER_KEY"
+          test -n "$KERNAID_TEST_ISO_PASSPHRASE"
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: "rustfmt, clippy"
@@ -72,7 +86,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cryptsetup dosfstools e2fsprogs gdisk mtools ntfs-3g \
-            ovmf qemu-system-x86 shellcheck squashfs-tools udev util-linux xorriso
+            gnupg ovmf qemu-system-x86 shellcheck squashfs-tools udev util-linux xorriso
       - name: Harden OVMF firmware ancestry
         run: |
           sudo /usr/bin/python3 -I -B - <<'PY'
@@ -132,6 +146,8 @@ jobs:
         run: |
           python3 -B -m unittest discover -s tools/build-rescue/tests -p 'test_*.py' -v
           bash -n tools/build-rescue/build.sh \
+            tools/build-rescue/stage-assistant.sh \
+            tools/build-rescue/encrypt-private-test-image.sh \
             tools/build-rescue/qemu-smoke.sh \
             tools/build-rescue/qemu-with-resident-snapshot.sh \
             tools/build-rescue/qemu-usb-smoke.sh \
@@ -139,6 +155,8 @@ jobs:
             tests/integration/linux-snapshot-resident-ipc.sh \
             tests/integration/run-linux-snapshot-resident-ipc-ci.sh
           shellcheck tools/build-rescue/build.sh \
+            tools/build-rescue/stage-assistant.sh \
+            tools/build-rescue/encrypt-private-test-image.sh \
             tools/build-rescue/qemu-smoke.sh \
             tools/build-rescue/qemu-with-resident-snapshot.sh \
             tools/build-rescue/qemu-usb-smoke.sh \
@@ -172,6 +190,7 @@ jobs:
           cargo build --locked --release -p kernaid-rescue-secrets \
             --features privileged-probe --bin kernaid-rescue-vault-probe
       - name: Publish the host-only lifecycle probe input
+        if: ${{ !inputs.private_testing }}
         uses: actions/upload-artifact@v4
         with:
           name: KernAid-Rescue-vault-lifecycle-probe-input
@@ -303,7 +322,20 @@ jobs:
           sudo /usr/bin/python3 -I tools/build-rescue/verify-shipping-binary.py \
             --profile tauri-webkit "$preflight_dir/kernaid-rescue-desk-shell"
       - name: Stage pinned Pi assistant and local SearXNG
+        if: ${{ !inputs.private_testing }}
         run: bash tools/build-rescue/stage-assistant.sh
+      - name: Stage private testing assistant credential
+        if: inputs.private_testing
+        env:
+          KERNAID_TEST_GEMROUTER_KEY: ${{ secrets.KERNAID_TEST_GEMROUTER_KEY }}
+        run: |
+          umask 077
+          key_file="$(mktemp "$RUNNER_TEMP/kernaid-private-key.XXXXXXXX")"
+          trap 'rm -f -- "$key_file"' EXIT
+          printf '%s' "$KERNAID_TEST_GEMROUTER_KEY" >"$key_file"
+          unset KERNAID_TEST_GEMROUTER_KEY
+          KERNAID_PRIVATE_TESTING=1 KERNAID_PRIVATE_GEMROUTER_KEY_FILE="$key_file" \
+            bash tools/build-rescue/stage-assistant.sh
       - name: Build hybrid BIOS and UEFI ISO
         run: |
           docker run --rm --privileged \
@@ -365,6 +397,7 @@ jobs:
           test -r "$log"
           test "$(stat -c '%u:%a' "$log")" = "$(id -u):644"
       - name: Derive catalog entry from the tested ISO and attested QEMU logs
+        if: ${{ !inputs.private_testing }}
         env:
           KERNAID_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           KERNAID_ARTIFACT_VERSION: ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -384,6 +417,7 @@ jobs:
           /usr/bin/python3 -m json.tool \
             KernAid-Rescue-amd64.catalog-entry.json >/dev/null
       - name: Derive and validate the inactive catalog-v2 evidence artifact
+        if: ${{ !inputs.private_testing }}
         env:
           KERNAID_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           KERNAID_ARTIFACT_VERSION: ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -431,7 +465,7 @@ jobs:
               raise SystemExit("catalog-v2 artifact did not validate exactly once")
           PY
       - name: Publish smoke diagnostics
-        if: always()
+        if: ${{ always() && !inputs.private_testing }}
         uses: actions/upload-artifact@v4
         with:
           name: KernAid-Rescue-smoke-logs
@@ -441,6 +475,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
       - name: Publish sanitized Linux snapshot E2E evidence
+        if: ${{ !inputs.private_testing }}
         uses: actions/upload-artifact@v4
         with:
           name: KernAid-Linux-snapshot-e2e-evidence
@@ -448,6 +483,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Publish checksums and image
+        if: ${{ !inputs.private_testing }}
         uses: actions/upload-artifact@v4
         with:
           name: KernAid-Rescue-amd64
@@ -460,7 +496,33 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Encrypt the smoke-tested private testing image
+        if: inputs.private_testing
+        env:
+          KERNAID_TEST_ISO_PASSPHRASE: ${{ secrets.KERNAID_TEST_ISO_PASSPHRASE }}
+        run: |
+          bash tools/build-rescue/encrypt-private-test-image.sh \
+            "$PWD/KernAid-Rescue-amd64.iso" \
+            "$RUNNER_TEMP/KernAid-Rescue-amd64-PRIVATE-testing.tar.gpg"
+      - name: Publish only the encrypted private testing image
+        if: inputs.private_testing
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernAid-Rescue-amd64-PRIVATE-testing-encrypted
+          path: ${{ runner.temp }}/KernAid-Rescue-amd64-PRIVATE-testing.tar.gpg
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+      - name: Remove private testing plaintext staging
+        if: ${{ always() && inputs.private_testing }}
+        run: |
+          sudo rm -f -- \
+            rescue/live-build/config/includes.chroot/etc/kernaid-assistant/gemrouter.key \
+            rescue/live-build/config/includes.chroot/etc/systemd/system/kernaid-assistant.service.d/50-private-credential.conf \
+            KernAid-Rescue-amd64.iso KernAid-Rescue-amd64.iso.sha256
+
   native-vault-prompt-bios:
+    if: ${{ !inputs.private_testing }}
     needs: build-and-smoke-test
     runs-on: ubuntu-24.04
     timeout-minutes: 155
@@ -579,6 +641,7 @@ jobs:
           retention-days: 30
 
   vault-lifecycle-bios:
+    if: ${{ !inputs.private_testing }}
     needs: build-and-smoke-test
     runs-on: ubuntu-24.04
     timeout-minutes: 190
@@ -858,6 +921,7 @@ jobs:
           retention-days: 14
 
   vault-lifecycle-uefi:
+    if: ${{ !inputs.private_testing }}
     needs: build-and-smoke-test
     runs-on: ubuntu-24.04
     timeout-minutes: 190
@@ -1137,7 +1201,7 @@ jobs:
           retention-days: 14
 
   qualified-release:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && !inputs.private_testing
     needs:
       - build-and-smoke-test
       - native-vault-prompt-bios
