@@ -337,6 +337,7 @@ jobs:
           KERNAID_PRIVATE_TESTING=1 KERNAID_PRIVATE_GEMROUTER_KEY_FILE="$key_file" \
             bash tools/build-rescue/stage-assistant.sh
       - name: Build hybrid BIOS and UEFI ISO
+        id: build_image
         run: |
           docker run --rm --privileged \
             -e KERNAID_DESK_PREBUILT=1 \
@@ -357,6 +358,7 @@ jobs:
             debian:trixie-slim \
             sh -c 'apt-get update && apt-get install -y binutils live-build ca-certificates openssl python3 && install -d -o root -g root -m 0755 /opt/kernaid-codex-root/usr/lib/kernaid && python3 -I tools/build-rescue/fetch-codex-cli.py --lock rescue/codex/codex-cli.lock.json --root /opt/kernaid-codex-root && ./tools/build-rescue/build.sh'
       - name: Verify stable image excludes repair surfaces
+        id: repair_surface
         run: python3 -I -B tools/build-rescue/verify-repair-surface.py --mode stable --iso KernAid-Rescue-amd64.iso
       - name: Generate the pinned Codex SBOM tranche
         run: |
@@ -364,10 +366,13 @@ jobs:
             --lock rescue/codex/codex-cli.lock.json \
             --output KernAid-Rescue-amd64.codex.cdx.json
       - name: QEMU BIOS smoke test
+        id: smoke_bios
         run: KERNAID_SMOKE_LOG=rescue-smoke-bios.log ./tools/build-rescue/qemu-smoke.sh bios
       - name: QEMU UEFI Secure Boot smoke test
+        id: smoke_uefi
         run: KERNAID_SMOKE_LOG=rescue-smoke-uefi.log ./tools/build-rescue/qemu-smoke.sh secureboot
       - name: Publish only allowlisted Resident and Rescue snapshot digests
+        id: snapshot_evidence
         run: |
           python3 -I -B tools/test-linux-snapshot/sanitize_e2e.py \
             --resident "$RUNNER_TEMP/kernaid-linux-snapshot-resident.e2e.log" \
@@ -375,6 +380,7 @@ jobs:
             --uefi "$PWD/rescue-smoke-uefi.log" \
             --output "$RUNNER_TEMP/kernaid-linux-snapshot-e2e.sanitized.log"
       - name: QEMU BIOS USB-style two-boot smoke test
+        id: smoke_usb_bios
         run: |
           log="$PWD/rescue-usb-smoke-bios.log"
           : >"$log"
@@ -386,6 +392,7 @@ jobs:
           test -r "$log"
           test "$(stat -c '%u:%a' "$log")" = "$(id -u):644"
       - name: QEMU UEFI USB-style two-boot smoke test
+        id: smoke_usb_uefi
         run: |
           log="$PWD/rescue-usb-smoke-uefi.log"
           : >"$log"
@@ -496,16 +503,56 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Encrypt the smoke-tested private testing image
-        if: inputs.private_testing
+      - name: Publish only closed private readiness failure markers
+        if: ${{ always() && inputs.private_testing && steps.build_image.outcome == 'success' }}
+        run: |
+          python3 -I -B - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import stat
+
+          source = Path("rescue/live-build/config/includes.chroot/usr/lib/kernaid/ready-check").read_bytes()
+          allowed = {
+              b"KERNAID_RESCUE_READINESS_FAILURE_V1 code=" + code
+              for code in re.findall(rb"readiness_code=([a-z0-9-]+) ;;", source)
+          }
+          observed = set()
+          for name in ("rescue-smoke-bios.log", "rescue-smoke-uefi.log"):
+              try:
+                  descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+              except OSError:
+                  continue
+              with os.fdopen(descriptor, "rb") as stream:
+                  metadata = os.fstat(stream.fileno())
+                  if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                      continue
+                  stream.seek(max(0, metadata.st_size - 8 * 1024 * 1024))
+                  for raw_line in stream.read(8 * 1024 * 1024).split(b"\n"):
+                      line = raw_line.removesuffix(b"\r")
+                      if line in allowed:
+                          observed.add(line)
+          for line in sorted(observed):
+              print(line.decode("ascii"))
+          PY
+      - name: Encrypt private testing image and bounded diagnostics
+        id: encrypt_private
+        if: ${{ always() && inputs.private_testing && steps.build_image.outcome == 'success' }}
         env:
           KERNAID_TEST_ISO_PASSPHRASE: ${{ secrets.KERNAID_TEST_ISO_PASSPHRASE }}
+          KERNAID_PRIVATE_BUILD_OUTCOME: ${{ steps.build_image.outcome }}
+          KERNAID_PRIVATE_REPAIR_SURFACE_OUTCOME: ${{ steps.repair_surface.outcome }}
+          KERNAID_PRIVATE_BIOS_OUTCOME: ${{ steps.smoke_bios.outcome }}
+          KERNAID_PRIVATE_UEFI_OUTCOME: ${{ steps.smoke_uefi.outcome }}
+          KERNAID_PRIVATE_SNAPSHOT_OUTCOME: ${{ steps.snapshot_evidence.outcome }}
+          KERNAID_PRIVATE_USB_BIOS_OUTCOME: ${{ steps.smoke_usb_bios.outcome }}
+          KERNAID_PRIVATE_USB_UEFI_OUTCOME: ${{ steps.smoke_usb_uefi.outcome }}
         run: |
           bash tools/build-rescue/encrypt-private-test-image.sh \
             "$PWD/KernAid-Rescue-amd64.iso" \
-            "$RUNNER_TEMP/KernAid-Rescue-amd64-PRIVATE-testing.tar.gpg"
+            "$RUNNER_TEMP/KernAid-Rescue-amd64-PRIVATE-testing.tar.gpg" --diagnostics
       - name: Publish only the encrypted private testing image
-        if: inputs.private_testing
+        if: ${{ always() && inputs.private_testing && steps.encrypt_private.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: KernAid-Rescue-amd64-PRIVATE-testing-encrypted

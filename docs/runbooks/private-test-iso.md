@@ -24,8 +24,11 @@ and USB-style two-boot checks. It does not run the separate persistence/native
 Vault qualification jobs, generate trusted-catalog entries, or promote a
 qualified release. Those gates remain independent and open.
 
-The tested ISO and its checksum are bundled and encrypted with GPG AES-256
-before artifact upload. No plaintext credential-containing image is uploaded
+The ISO, checksum, gate outcomes and bounded boot diagnostics are bundled and
+encrypted with GPG AES-256 before artifact upload. If image construction passes
+but a subsequent smoke fails, the encrypted diagnostic bundle is retained for
+investigation; its existence is not permission to publish or install that image.
+No plaintext credential-containing image is uploaded
 to the public repository's Actions artifacts. The public build path is
 unchanged and does not read the test credential.
 
@@ -33,6 +36,9 @@ unchanged and does not read the test credential.
 
 1. Verify the run's source SHA, `private_testing` input and successful base
    build/boot jobs. Download only that run's encrypted private-testing bundle.
+   A failed run may have a diagnostic bundle too; do not publish it as a
+   usable candidate. All recorded build, surface, snapshot and four boot gate
+   outcomes in `private-test-status.txt` must be `success` before publication.
 2. Decrypt locally using the operator's `test-iso-artifact.pass` file, supplied
    through a file descriptor, never an argument or log. Check the decrypted
    archive entries before extraction and verify its SHA-256 sidecar.

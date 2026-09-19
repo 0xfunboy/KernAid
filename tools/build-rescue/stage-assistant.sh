@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# The private workflow creates its input credential under umask 077. Public
+# runtime directories must remain traversable after the image hook makes them
+# root-owned; pnpm and git otherwise inherit owner-only directory permissions.
+# This child-shell mask does not affect the caller, and credentials below are
+# still installed with an explicit 0600 mode.
+umask 022
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 image_root="$repo_dir/rescue/live-build/config/includes.chroot"
 private_key_destination="$image_root/etc/kernaid-assistant/gemrouter.key"

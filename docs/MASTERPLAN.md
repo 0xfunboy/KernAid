@@ -1089,7 +1089,11 @@ remaining gates stated accurately. Not an authorization to sell repairs.
 
 ### P1 — Recoverable Consumer RC
 
-- Fix the exact Vault readiness failure before promising reboot persistence.
+- Resolve the reproduced firstboot input/provisioning timeouts before promising
+  reboot persistence: run `35412459885` stopped at `firstboot-confirmation`
+  in both lifecycle jobs and `firstboot-result` in the native prompt job.
+  The latter never reached its second-boot native dialog. These markers locate
+  the failed waits; they do not establish a specific runtime root cause.
 - Close diagnosis → readable explanation → report export, including offline
   operation and cancellation. Keep provider credentials out of reports.
 - Connect diagnostic evidence to the bounded assistant with explicit context

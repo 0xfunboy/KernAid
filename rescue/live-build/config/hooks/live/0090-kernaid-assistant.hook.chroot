@@ -10,6 +10,34 @@ chown root:root /etc/kernaid-assistant/searxng.yml \
     /etc/systemd/system/kernaid-assistant.service \
     /etc/systemd/system/kernaid-search.service \
     /etc/systemd/system/kernaid-ui.service.d/40-kernaid-assistant.conf
+# BEGIN public assistant asset permissions
+# A root import alone cannot detect owner-only staged directories. Check public
+# access bits without requiring service accounts to have been created already.
+# Credentials are deliberately absent from this allowlist.
+python3 -I - <<'PY'
+import os
+import stat
+
+for path in (
+    "/opt",
+    "/opt/kernaid",
+    "/opt/kernaid/assistant",
+    "/opt/kernaid/assistant/node_modules",
+    "/opt/kernaid/assistant/node_modules/.pnpm",
+    "/opt/kernaid/searxng-source",
+):
+    metadata = os.stat(path)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_mode & 0o005 != 0o005:
+        raise SystemExit("Public assistant asset directory is not readable/traversable")
+for name in ("server.mjs", "runtime.mjs", "gemrouter-transport.mjs", "defaults.json"):
+    metadata = os.stat("/opt/kernaid/assistant/" + name)
+    if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o004:
+        raise SystemExit("Public assistant runtime file is not readable")
+metadata = os.stat("/opt/kernaid/assistant/node")
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o005 != 0o005:
+    raise SystemExit("Public assistant Node runtime is not readable/executable")
+PY
+# END public assistant asset permissions
 if [ -f /etc/kernaid-assistant/gemrouter.key ]; then
     chown root:root /etc/kernaid-assistant/gemrouter.key \
         /etc/systemd/system/kernaid-assistant.service.d/50-private-credential.conf

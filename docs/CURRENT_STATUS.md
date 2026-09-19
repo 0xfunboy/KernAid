@@ -15,7 +15,24 @@ wizard configuration restoration and production Pi/SearXNG packaging. The
 local runtime checks and Desk build passed; a new exact-image qualification
 is still required before changing the stable download.
 
-Active candidate: source `53afa5acbea219b4c2e4f5cc347da33884bc2544`,
+New private testing candidate: source `25b88fc3348999dc8dd4e2d3d70330b4b186e832`,
+[Rescue run 35418581057](https://github.com/0xfunboy/KernAid/actions/runs/35418581057),
+dispatched with `private_testing=true`. It integrates the network-first wizard,
+consented summaries and verified Gemini-backed Pi transport. Image construction
+passed (1,445,363,712 bytes), but BIOS smoke failed with a not-ready marker;
+no download was published. The private staging step inherited `umask 077`,
+which was reproduced making the runtime directories mode `0700`. The build
+then made them root-owned, inaccessible to the dedicated service identities.
+This deterministic packaging defect is corrected in the follow-up: public
+runtime staging uses `022`, private files retain explicit `0600`, and the
+target-distribution preflight checks asset access bits before boot. All 389
+image-tooling checks pass locally. Failed smoke output is now retained privately
+with the exact gate outcomes, without allowing failed images into downloads.
+The first private dispatch, `35418400202`, stopped before image creation on
+one stale exact-package-list assertion. The `gnupg` expectation was updated
+without changing the OVMF hardening checks; the focused regression passes.
+
+Previous candidate: source `53afa5acbea219b4c2e4f5cc347da33884bc2544`,
 [Rescue run 35412459885](https://github.com/0xfunboy/KernAid/actions/runs/35412459885),
 dispatched on 19 September and **completed without release promotion**. Only this
 Rescue cohort was dispatched; unrelated platform rebuilds were not started.
