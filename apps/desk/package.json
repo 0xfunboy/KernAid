@@ -13,6 +13,7 @@
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
+    "@kernaid/assistant-context": "workspace:*",
     "@kernaid/agent-gateway": "workspace:*",
     "@kernaid/schemas": "workspace:*",
     "@kernaid/session-driver": "workspace:*",

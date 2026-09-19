@@ -1,0 +1,19 @@
+{
+  "name": "@kernaid/assistant-context",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.mjs"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "check": "node --check src/index.mjs",
+    "test": "node --test test/*.test.mjs"
+  }
+}

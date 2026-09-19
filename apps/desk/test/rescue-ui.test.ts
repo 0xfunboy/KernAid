@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { RescueOfflineInspectionError } from "../src/native.js";
+import { assistantInspectionContext } from "../src/assistant-context.js";
 import {
   finishRescueInspection,
   formatBytes,
@@ -165,6 +166,40 @@ test("inspection presentation exposes only normalized read-only facts", () => {
   );
   assert.ok(view.facts.some((fact) => /dirty\/ibernazione/u.test(fact)));
   assert.doesNotMatch(JSON.stringify(view), /scan:|target:|disk-1/u);
+});
+
+test("assistant sharing excludes identifiers and requires a completed current inspection", () => {
+  const scan = targetScanFixture();
+  const selection = {
+    apiVersion: scan.apiVersion,
+    status: "observe-target-validated" as const,
+    scanFingerprint: scan.scanFingerprint,
+    target: scan.candidates[0]!,
+    claims: selectionClaims(),
+  };
+  const inspection = windowsInspectionFixture();
+  const context = assistantInspectionContext(selection, inspection);
+  assert.equal(context?.osFamily, "windows");
+  assert.equal(context?.observations.efiBcdPresent, true);
+  assert.doesNotMatch(
+    JSON.stringify(context),
+    /scan:|target:|disk-1|limitations|sourceRef/,
+  );
+  assert.equal(
+    assistantInspectionContext(
+      { ...selection, target: scan.candidates[1]! },
+      inspection,
+    ),
+    undefined,
+  );
+  assert.equal(
+    assistantInspectionContext(selection, {
+      ...inspection,
+      claims: { ...inspection.claims, mountCleanupVerified: false },
+    }),
+    undefined,
+  );
+  assert.equal(assistantInspectionContext(undefined, inspection), undefined);
 });
 
 test("stale inspection responses cannot survive an epoch change or retarget", () => {

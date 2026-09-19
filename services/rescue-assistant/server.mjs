@@ -45,7 +45,12 @@ async function dispatch(request) {
       case "models":
         return await runtime.models();
       case "chat":
-        return await runtime.chat(request.message);
+        return await runtime.chat(
+          request.message,
+          request.context,
+          request.expectedProvider,
+          request.conversationId,
+        );
       default:
         throw new Error("Unknown assistant operation.");
     }

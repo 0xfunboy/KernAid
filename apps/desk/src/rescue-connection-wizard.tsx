@@ -1,4 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
+import {
+  assistantContextPreview,
+  type AssistantInspectionContext,
+} from "@kernaid/assistant-context";
 import "./rescue-connection-wizard.css";
 
 type Adapter = {
@@ -37,9 +41,13 @@ async function call<T>(
 export function RescueConnectionWizard({
   ready,
   onReady,
+  context,
+  contextKey,
 }: {
   ready: boolean;
   onReady: () => void;
+  context?: AssistantInspectionContext;
+  contextKey: string;
 }) {
   const [expanded, setExpanded] = useState(true);
   const [status, setStatus] = useState<AssistantStatus>();
@@ -59,6 +67,24 @@ export function RescueConnectionWizard({
   const [busy, setBusy] = useState("");
   const inFlight = useRef(false);
   const [error, setError] = useState("");
+  const [contextConsent, setContextConsent] = useState<string>();
+  const preview = context ? assistantContextPreview(context) : "";
+  const contextBinding = JSON.stringify([
+    contextKey,
+    preview,
+    surface,
+    baseUrl,
+    model,
+  ]);
+  const shareContext = Boolean(context && contextConsent === contextBinding);
+  const latestContextKey = useRef(contextKey);
+  const conversationId = useRef(crypto.randomUUID());
+  useEffect(() => {
+    latestContextKey.current = contextKey;
+    conversationId.current = crypto.randomUUID();
+    setContextConsent(undefined);
+    setMessages([]);
+  }, [contextKey]);
   async function work(label: string, fn: () => Promise<void>) {
     if (inFlight.current) return;
     inFlight.current = true;
@@ -107,6 +133,9 @@ export function RescueConnectionWizard({
       ...(apiKey ? { apiKey } : {}),
     });
     setStatus(next);
+    setSurface(next.config.surface);
+    setBaseUrl(next.config.baseUrl);
+    setModel(next.config.model);
     setApiKey("");
     setVerified(false);
     setMessages([]);
@@ -346,6 +375,7 @@ export function RescueConnectionWizard({
                   void work("Checking the model connection…", async () => {
                     await configure();
                     const reply = await call<{ answer: string }>("chat", {
+                      conversationId: conversationId.current,
                       message:
                         "Reply with a brief welcome to KernAid and ask what is wrong with this computer. Do not search the web for this greeting.",
                     });
@@ -363,12 +393,13 @@ export function RescueConnectionWizard({
               </p>
             </fieldset>
           </div>
-          {messages.length > 0 && (
+          {(verified || messages.length > 0) && (
             <div className="connection-chat" aria-label="Recovery assistant">
               <h2>Tell us what happened</h2>
               <p>
-                Pi can search the web with SearXNG. Only your messages are sent
-                to the model; disk contents are not sent automatically.
+                Pi can search the web with SearXNG. Only your messages and any
+                summary you explicitly approve below are sent to the model. File
+                contents are not attached.
               </p>
               <div aria-live="polite">
                 {messages.map((item, index) => (
@@ -385,13 +416,33 @@ export function RescueConnectionWizard({
                 onSubmit={(e) => {
                   e.preventDefault();
                   const text = message.trim();
-                  if (!text) return;
+                  if (!text || !verified || inFlight.current) return;
+                  const attachment = shareContext ? context : undefined;
+                  const submittedContextKey = contextKey;
                   void work("Pi is answering…", async () => {
-                    setMessages((items) => [...items, { role: "You", text }]);
+                    setMessages((items) => [
+                      ...items,
+                      {
+                        role: "You",
+                        text: attachment
+                          ? `${text}\n[Approved read-only summary attached · separate analysis]`
+                          : text,
+                      },
+                    ]);
                     setMessage("");
+                    setContextConsent(undefined);
                     const result = await call<{ answer: string }>("chat", {
                       message: text,
+                      conversationId: conversationId.current,
+                      ...(attachment
+                        ? {
+                            context: attachment,
+                            expectedProvider: { surface, baseUrl, model },
+                          }
+                        : {}),
                     });
+                    if (submittedContextKey !== latestContextKey.current)
+                      return;
                     setMessages((items) => [
                       ...items,
                       { role: "KernAid", text: result.answer },
@@ -399,6 +450,43 @@ export function RescueConnectionWizard({
                   });
                 }}
               >
+                {context && (
+                  <div className="connection-context">
+                    <h3>Let Pi explain this computer’s checks</h3>
+                    <p>
+                      {context.osFamily === "windows" ? "Windows" : "Linux"} ·
+                      read-only inspection ·{" "}
+                      {context.installationConfirmed
+                        ? "installation detected"
+                        : "installation not confirmed"}
+                      . This summary contains only boot/update indicators and
+                      counts. No names, disk IDs, paths, file contents or keys.
+                    </p>
+                    <details>
+                      <summary>Review the exact data to share</summary>
+                      <pre>{preview}</pre>
+                    </details>
+                    <label className="connection-consent">
+                      <input
+                        type="checkbox"
+                        checked={shareContext}
+                        disabled={Boolean(busy)}
+                        onChange={(e) =>
+                          setContextConsent(
+                            e.target.checked ? contextBinding : undefined,
+                          )
+                        }
+                      />
+                      Share this summary with {status?.config.label || surface}{" "}
+                      ({model}) for this question only.
+                    </label>
+                    <p>
+                      Separate analysis without earlier chat history. Approval
+                      resets after sending; replies are advice, not an executed
+                      repair.
+                    </p>
+                  </div>
+                )}
                 <label>
                   Your question
                   <textarea

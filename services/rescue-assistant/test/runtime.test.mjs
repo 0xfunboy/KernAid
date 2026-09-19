@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { linuxContext } from "../../../packages/assistant-context/test/fixture.mjs";
 import {
   AssistantRuntime,
   endpoint,
@@ -161,8 +162,120 @@ test("an unresponsive model cannot leave the wizard busy indefinitely", async ()
       disposed = true;
     },
   };
-  await assert.rejects(runtime.chat("hello"), /Assistant unavailable/);
+  await assert.rejects(runtime.chat("hello"), /Assistant timed out/);
   assert.equal(runtime.busy, false);
   assert.equal(runtime.session, undefined);
   assert.equal(disposed, true);
+});
+
+test("shared evidence uses a fresh one-question session and cannot leak into later chat", async () => {
+  const runtime = new AssistantRuntime({ stateDir: "/unused", searchUrl: "" });
+  let previousDisposed = false;
+  let evidenceDisposed = false;
+  let received;
+  runtime.session = {
+    dispose() {
+      previousDisposed = true;
+    },
+  };
+  const session = {
+    messages: [],
+    agent: { abort() {} },
+    subscribe: () => () => {},
+    dispose() {
+      evidenceDisposed = true;
+    },
+    async prompt(text) {
+      received = text;
+      this.messages.push({
+        role: "assistant",
+        stopReason: "stop",
+        content: [
+          {
+            type: "text",
+            text: "Check the boot configuration; no repair executed.",
+          },
+        ],
+      });
+    },
+  };
+  runtime.createSession = async () => session;
+  const result = await runtime.chat(
+    "Explain these checks",
+    linuxContext(),
+    runtime.config,
+  );
+  assert.match(result.answer, /no repair/);
+  assert.match(received, /untrusted observations/);
+  assert.match(received, /"initramfsArtifactCount":0/);
+  assert.equal(previousDisposed, true);
+  assert.equal(evidenceDisposed, true);
+  assert.equal(runtime.session, undefined);
+});
+
+test("context cannot be sent to a changed provider or with unreviewed free-form fields", async () => {
+  const runtime = new AssistantRuntime({ stateDir: "/unused" });
+  runtime.createSession = async () => {
+    throw new Error("must not send");
+  };
+  for (const expected of [
+    undefined,
+    { ...runtime.config, model: "different-model" },
+    { ...runtime.config, baseUrl: "https://different.example" },
+  ])
+    await assert.rejects(
+      runtime.chat("Explain", linuxContext(), expected),
+      /provider changed/,
+    );
+  await assert.rejects(
+    runtime.chat(
+      "Explain",
+      { ...linuxContext(), token: "synthetic-secret" },
+      runtime.config,
+    ),
+    /Invalid diagnostic summary/,
+  );
+  assert.equal(runtime.busy, false);
+});
+
+test("retarget conversation epochs discard ordinary chat history without sending identifiers", async () => {
+  const runtime = new AssistantRuntime({ stateDir: "/unused", searchUrl: "" });
+  const sessions = [];
+  runtime.createSession = async () => {
+    const session = {
+      messages: [],
+      prompts: [],
+      disposed: false,
+      agent: { abort() {} },
+      subscribe: () => () => {},
+      dispose() {
+        this.disposed = true;
+      },
+      async prompt(text) {
+        this.prompts.push(text);
+        this.messages.push({
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "Advice only" }],
+        });
+      },
+    };
+    sessions.push(session);
+    return session;
+  };
+  const first = "12345678-1234-4123-8123-123456789abc";
+  const second = "12345678-1234-4123-8123-123456789def";
+  await runtime.chat("Machine A", undefined, undefined, first);
+  await runtime.chat("Another A question", undefined, undefined, first);
+  assert.equal(sessions.length, 1);
+  await runtime.chat("Machine B", undefined, undefined, second);
+  assert.equal(sessions.length, 2);
+  assert.equal(sessions[0].disposed, true);
+  assert.deepEqual(sessions[1].prompts, ["Machine B"]);
+  assert.ok(!JSON.stringify(sessions).includes(first));
+  assert.ok(!JSON.stringify(sessions).includes(second));
+  await assert.rejects(
+    runtime.chat("hi", undefined, undefined, "hostname-private"),
+    /Invalid conversation/,
+  );
 });

@@ -14,7 +14,7 @@ in-memory; the private development key is a separate service credential.
 
 Pi staging now includes only runtime files and checks import on both the build
 host and target Debian chroot; the chroot also checks the pinned SearXNG import.
-Seven focused runtime tests and the Desk production build passed locally.
+The focused runtime checks and Desk production build passed locally.
 The existing QEMU smoke now additionally requires a running local HTTP-to-Unix
 assistant relay, successful NetworkManager enumeration, SearXNG `/healthz`
 and both systemd services active. It does not call a remote model or search
@@ -35,11 +35,44 @@ bounded request still reports failures. This is not a verified fix of that PC.
    surface or a custom HTTPS base URL. Fetch `/models` or enter a model. Default:
    `gemini-3.8-flash` at `https://gemr.airewardrop.xyz`.
 3. Verify an actual response and talk to Pi before selecting a disk. The
-   assistant stays accessible during diagnosis. Only the conversation goes to
-   the model; disk contents are not uploaded automatically.
+   assistant stays accessible during diagnosis. Only the conversation and an
+   explicitly reviewed optional summary go to the model; files are not uploaded.
 4. Continue to existing evidence collection and diagnosis. Pi is advisory and
    cannot authorize or execute repairs. The existing broker/approval flow is
    still authoritative.
+5. After read-only inspection, reopen the assistant to explain its checks.
+   Review the exact allowlisted summary, approve sharing for this question
+   and ask Pi. This is advisory interpretation, not the signed diagnosis or
+   an executable plan; the main diagnostic controls remain authoritative.
+
+## Consented inspection summary
+
+`@kernaid/assistant-context` is the shared browser/daemon contract. It accepts
+only OS/filesystem enums, booleans and bounded counts: Windows boot/update
+presence markers or Linux boot/fstab/package-database indicators. No free-form
+collector output, release names, paths, target fingerprints, hostnames, disk
+IDs, report blobs or keys can be attached through this schema. Unknown fields
+and invalid facts are rejected, not forwarded.
+
+The projection exists only for a completed read-only inspection of the still
+selected target with verified mount cleanup. The UI shows the exact outgoing
+data and the provider/model; approval binds the target, preview and endpoint
+and resets after each send. The daemon independently rejects a changed
+provider/model. Each attached summary uses a fresh one-question Pi session,
+discarded after success or failure; follow-up questions need another explicit
+attachment. Retargeting clears visible chat and drops late answers for the old
+target. An opaque local conversation epoch also resets ordinary backend chat
+history on retarget; it is never included in the model prompt. Normalized
+provider configuration is reflected back into the UI before consent binding.
+Text typed by the user still goes to the selected provider as before.
+
+The summary is untrusted observations, not instructions or proof of hardware
+health. Missing boot artifacts can reflect an uninspected separate filesystem;
+the model is explicitly told not to infer corruption or an executed repair.
+Unit checks cover projection/redaction, stale selection, closed schema,
+endpoint binding and session disposal. Exact-image and real-provider behavior
+remain qualification gates; the currently running `53afa5a` build predates
+this additional source batch.
 
 Wi-Fi passwords travel to `nmcli --ask` over stdin. NetworkManager owns its
 profile in the live OS. Hidden SSID entry, enterprise 802.1X and captive-portal
@@ -90,8 +123,9 @@ Both Rescue workflows stage the bundle with
 the minimal Debian container. Use a fresh build worktree: staging refuses to
 overwrite prior bundles. The chroot hook installs pinned SearXNG requirements
 and enables services. The assistant runs as an unprivileged dedicated user with
-private devices. Polkit grants only live NetworkManager control, Wi-Fi scan and
-its own profile changes. The UI's group-restricted Unix-socket relay checks
+private devices. Polkit grants the dedicated assistant account live
+NetworkManager control, Wi-Fi scan and live-system profile changes (the daemon
+has no login session for private profiles). The UI's group-restricted relay checks
 Origin/Host and bounds request sizes and timeouts.
 
 Public images ask for a key. For preconfigured **private test media**, supply
@@ -119,5 +153,12 @@ The image-generation endpoint is not used by this diagnostic assistant.
 - Later Gemrouter requests timed out. The complete live Pi→search→answer chain
   still needs confirmation once upstream is responsive; local tests prove the
   protocol, not remote reliability.
+- On 19 September the synthetic, consented-summary Pi probe reached its 60 s
+  deadline. Direct requests outside Pi also timed out: minimal non-streaming
+  `/chat/completions` at 20 s and `/models` at 10 s, without a response status.
+  Thus the failure is not exclusively a Pi streaming issue; endpoint/network
+  reachability from this machine remains an external gate. No unsupported
+  compatibility change or automatic model substitution was made. Timeout now
+  tells the user to retry or continue offline, without implying an invalid key.
 - New ISO/boot qualification, physical Wi-Fi and the reported disk-selection
   issue remain to be tested. Existing ISO/Vault/repair limitations still apply.

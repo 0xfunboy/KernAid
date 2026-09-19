@@ -32,6 +32,9 @@ importers:
       '@kernaid/agent-gateway':
         specifier: workspace:*
         version: link:../../services/agent-gateway
+      '@kernaid/assistant-context':
+        specifier: workspace:*
+        version: link:../../packages/assistant-context
       '@kernaid/schemas':
         specifier: workspace:*
         version: link:../../packages/schemas
@@ -77,6 +80,8 @@ importers:
         version: 6.4.3(@types/node@24.13.3)(jiti@2.7.0)(tsx@4.23.1)(yaml@2.9.0)
 
   apps/fleet-console: {}
+
+  packages/assistant-context: {}
 
   packages/fleet-schemas:
     devDependencies:
@@ -235,6 +240,9 @@ importers:
       '@earendil-works/pi-coding-agent':
         specifier: 0.80.10
         version: 0.80.10(ws@8.21.3)(zod@4.6.5)
+      '@kernaid/assistant-context':
+        specifier: workspace:*
+        version: link:../../packages/assistant-context
       typebox:
         specifier: 1.1.38
         version: 1.1.38

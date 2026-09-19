@@ -14,6 +14,7 @@
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
+    "@kernaid/assistant-context": "workspace:*",
     "@earendil-works/pi-coding-agent": "0.80.10",
     "typebox": "1.1.38"
   }

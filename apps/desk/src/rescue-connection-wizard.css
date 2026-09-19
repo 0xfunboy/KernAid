@@ -142,6 +142,27 @@ main.rescue-connected {
 .connection-message.user {
   border-left: 3px solid #80e0ce;
 }
+.connection-context {
+  margin: 20px 0;
+  padding: 18px;
+  border: 1px solid #48636e;
+  border-radius: 12px;
+}
+.connection-context pre {
+  max-height: 260px;
+  overflow: auto;
+  font-size: 12px;
+}
+.connection-wizard .connection-consent {
+  display: flex;
+  align-items: start;
+  gap: 12px;
+}
+.connection-wizard .connection-consent input {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
 @media (max-width: 760px) {
   .connection-columns {
     grid-template-columns: 1fr;

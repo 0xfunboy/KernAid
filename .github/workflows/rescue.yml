@@ -33,6 +33,7 @@ on:
       - "services/agent-gateway/**"
       - "services/rescue-assistant/**"
       - "packages/provider-types/**"
+      - "packages/assistant-context/**"
       - "packages/schemas/**"
       - "packages/session-driver/**"
       - "Cargo.toml"
@@ -62,6 +63,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Check network-first assistant contract
         run: |
+          pnpm --filter @kernaid/assistant-context test
           pnpm --filter @kernaid/rescue-assistant check
           pnpm --filter @kernaid/rescue-assistant test
       - run: KERNAID_REPAIR_CANDIDATE=0 pnpm --filter @kernaid/desk build

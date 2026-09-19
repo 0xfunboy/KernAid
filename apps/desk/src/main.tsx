@@ -106,6 +106,7 @@ import {
 import { FixtureRepairLabPanel } from "./fixture-repair-lab-panel";
 import { RescueDiagnosisWizard } from "./rescue-diagnosis-wizard";
 import { RescueConnectionWizard } from "./rescue-connection-wizard";
+import { assistantInspectionContext } from "./assistant-context";
 import { RescueRepairPanel } from "./rescue-repair-entry";
 import "./style.css";
 
@@ -1310,6 +1311,15 @@ function App() {
         <RescueConnectionWizard
           ready={connectionReady}
           onReady={() => setConnectionReady(true)}
+          context={assistantInspectionContext(
+            selectedRescueTarget,
+            rescueInspection,
+          )}
+          contextKey={
+            selectedRescueTarget
+              ? `${selectedRescueTarget.scanFingerprint}:${selectedRescueTarget.target.targetId}`
+              : ""
+          }
         />
       )}
       <header>
