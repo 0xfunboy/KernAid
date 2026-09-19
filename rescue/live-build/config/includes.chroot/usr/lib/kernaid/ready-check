@@ -9,6 +9,74 @@ if [ -r "$offline_inspection_marker" ] \
 fi
 
 fail() {
+    # Only exact source-owned reasons get an exported diagnostic. Keep this
+    # marker before NOT_READY so the host can classify even a split serial
+    # write without waiting for, or copying, arbitrary failure text.
+    readiness_code=
+    case "$*" in
+        "vault lifecycle daemon startup stage is unavailable") readiness_code=vault-startup-unavailable ;;
+        "vault lifecycle daemon last reported startup stage identity") readiness_code=vault-startup-identity ;;
+        "vault lifecycle daemon last reported startup stage listener") readiness_code=vault-startup-listener ;;
+        "vault lifecycle daemon last reported startup stage runtime") readiness_code=vault-startup-runtime ;;
+        "vault lifecycle daemon last reported startup stage rng") readiness_code=vault-startup-rng ;;
+        "vault lifecycle daemon last reported startup stage worker-cgroup") readiness_code=vault-startup-worker-cgroup ;;
+        "vault lifecycle daemon last reported startup stage worker-bootstrap") readiness_code=vault-startup-worker-bootstrap ;;
+        "vault lifecycle daemon last reported startup stage worker-caps") readiness_code=vault-startup-worker-caps ;;
+        "vault lifecycle daemon last reported startup stage worker-probe") readiness_code=vault-startup-worker-probe ;;
+        "vault lifecycle daemon last reported startup stage caps-final") readiness_code=vault-startup-caps-final ;;
+        "vault lifecycle daemon last reported startup stage ready") readiness_code=vault-startup-ready ;;
+        "vault lifecycle daemon state is unavailable") readiness_code=vault-service-state ;;
+        "vault lifecycle socket is not active") readiness_code=vault-socket-inactive ;;
+        "vault lifecycle socket state is unavailable") readiness_code=vault-socket-state ;;
+        "vault lifecycle socket is not operational") readiness_code=vault-socket-not-operational ;;
+        "vault lifecycle group is missing") readiness_code=vault-group ;;
+        "vault lifecycle pathname is not a socket") readiness_code=vault-socket-node ;;
+        "vault lifecycle socket ownership or mode is unsafe") readiness_code=vault-socket-metadata ;;
+        "QEMU provider probe credential is only partially imported") readiness_code=provider-probe-import ;;
+        "QEMU provider probe credential failed its pinned content gate") readiness_code=provider-probe-content ;;
+        "kernel console policy is unreadable") readiness_code=console-policy-unreadable ;;
+        "kernel console policy is unavailable") readiness_code=console-policy-unavailable ;;
+        "kernel console policy is unsafe") readiness_code=console-policy-unsafe ;;
+        "local UI server did not answer") readiness_code=ui-http ;;
+        "local connection assistant or search service did not answer") readiness_code=assistant-probe ;;
+        "local connection assistant or search service is not active") readiness_code=assistant-service ;;
+        "Application relay socket is not active") readiness_code=application-socket-inactive ;;
+        "Application relay socket state is unavailable") readiness_code=application-socket-state ;;
+        "Application relay socket is not operational") readiness_code=application-socket-not-operational ;;
+        "Application relay pathname is not a socket") readiness_code=application-socket-node ;;
+        "Application relay socket ownership or mode is unsafe") readiness_code=application-socket-metadata ;;
+        "Application relay status endpoint failed") readiness_code=application-status-http ;;
+        "Application relay status contract failed") readiness_code=application-status-contract ;;
+        "persistent Application relay is not active") readiness_code=application-service ;;
+        "persistent Application relay PID is unavailable") readiness_code=application-pid-unavailable ;;
+        "persistent Application relay PID is invalid") readiness_code=application-pid-invalid ;;
+        "persistent Application relay second status failed") readiness_code=application-status-second ;;
+        "persistent Application relay changed a read-only status response") readiness_code=application-status-changed ;;
+        "Application relay identity changed between lifecycle requests") readiness_code=application-identity-changed ;;
+        "JavaScript bundle path is missing") readiness_code=ui-bundle-path ;;
+        "JavaScript bundle is unavailable") readiness_code=ui-bundle-http ;;
+        "inventory endpoint failed") readiness_code=inventory-http ;;
+        "hostname evidence is missing") readiness_code=inventory-hostname ;;
+        "hardware evidence is missing") readiness_code=inventory-hardware ;;
+        "storage health evidence is missing") readiness_code=inventory-storage-health ;;
+        "boot critical path evidence is missing") readiness_code=inventory-boot-critical-path ;;
+        "filesystem health collector failed") readiness_code=filesystem-health-collector ;;
+        "filesystem health evidence is missing") readiness_code=filesystem-health-evidence ;;
+        "storage evidence is missing") readiness_code=inventory-storage ;;
+        "runtime inventory fingerprint failed") readiness_code=inventory-fingerprint ;;
+        "installed-target metadata endpoint failed") readiness_code=target-metadata-http ;;
+        "installed-target metadata contract failed") readiness_code=target-metadata-contract ;;
+        "installed-target selection request failed") readiness_code=target-selection-request ;;
+        "installed-target selection endpoint failed") readiness_code=target-selection-http ;;
+        "installed-target selection contract failed") readiness_code=target-selection-contract ;;
+        "composite Rescue target fingerprint failed") readiness_code=target-fingerprint ;;
+        "bound R0 authorization request failed") readiness_code=observe-request ;;
+        "bound R0 authorization endpoint failed") readiness_code=observe-http ;;
+        "bound R0 authorization was not accepted") readiness_code=observe-rejected ;;
+    esac
+    if [ -n "$readiness_code" ]; then
+        printf '\nKERNAID_RESCUE_READINESS_FAILURE_V1 code=%s\n' "$readiness_code" >/dev/ttyS0
+    fi
     printf '\nKERNAID_RESCUE_NOT_READY: %s\n' "$*" >/dev/ttyS0
     exit 1
 }

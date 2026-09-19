@@ -110,6 +110,81 @@ NOT_READY_PREFIX_PATTERN = re.compile(
     rb"(?:^|\r?\n)" + re.escape(NOT_READY_LINE_PREFIX)
 )
 NOT_READY_SCAN_OVERLAP = len(NOT_READY_LINE_PREFIX) + 2
+READINESS_FAILURE_CODES = (
+    b"vault-startup-unavailable",
+    b"vault-startup-identity",
+    b"vault-startup-listener",
+    b"vault-startup-runtime",
+    b"vault-startup-rng",
+    b"vault-startup-worker-cgroup",
+    b"vault-startup-worker-bootstrap",
+    b"vault-startup-worker-caps",
+    b"vault-startup-worker-probe",
+    b"vault-startup-caps-final",
+    b"vault-startup-ready",
+    b"vault-service-state",
+    b"vault-socket-inactive",
+    b"vault-socket-state",
+    b"vault-socket-not-operational",
+    b"vault-group",
+    b"vault-socket-node",
+    b"vault-socket-metadata",
+    b"provider-probe-import",
+    b"provider-probe-content",
+    b"console-policy-unreadable",
+    b"console-policy-unavailable",
+    b"console-policy-unsafe",
+    b"ui-http",
+    b"assistant-probe",
+    b"assistant-service",
+    b"application-socket-inactive",
+    b"application-socket-state",
+    b"application-socket-not-operational",
+    b"application-socket-node",
+    b"application-socket-metadata",
+    b"application-status-http",
+    b"application-status-contract",
+    b"application-service",
+    b"application-pid-unavailable",
+    b"application-pid-invalid",
+    b"application-status-second",
+    b"application-status-changed",
+    b"application-identity-changed",
+    b"ui-bundle-path",
+    b"ui-bundle-http",
+    b"inventory-http",
+    b"inventory-hostname",
+    b"inventory-hardware",
+    b"inventory-storage-health",
+    b"inventory-boot-critical-path",
+    b"filesystem-health-collector",
+    b"filesystem-health-evidence",
+    b"inventory-storage",
+    b"inventory-fingerprint",
+    b"target-metadata-http",
+    b"target-metadata-contract",
+    b"target-selection-request",
+    b"target-selection-http",
+    b"target-selection-contract",
+    b"target-fingerprint",
+    b"observe-request",
+    b"observe-http",
+    b"observe-rejected",
+)
+READINESS_NOT_READY_CONTEXT_PATTERN = re.compile(
+    rb"(?:^|\r?\n)KERNAID_RESCUE_READINESS_FAILURE_V1 code=("
+    + rb"|".join(re.escape(code) for code in READINESS_FAILURE_CODES)
+    + rb")\r?\n(?:\r?\n)?"
+    + re.escape(NOT_READY_LINE_PREFIX)
+)
+ASSISTANT_FAILURE_STAGES = (b"assistant", b"network", b"search")
+ASSISTANT_NOT_READY_CONTEXT_PATTERN = re.compile(
+    rb"(?:^|\r?\n)KERNAID_RESCUE_ASSISTANT_FAILURE_V1 stage=("
+    + rb"|".join(re.escape(stage) for stage in ASSISTANT_FAILURE_STAGES)
+    + rb")\r?\n(?:\r?\n)?"
+    + rb"(?:KERNAID_RESCUE_READINESS_FAILURE_V1 code=assistant-probe\r?\n(?:\r?\n)?)?"
+    + re.escape(NOT_READY_LINE_PREFIX)
+)
 TAURI_GUEST_FAILURE_STAGES = (
     b"http",
     b"x11",
@@ -2246,6 +2321,16 @@ class SerialConsole:
     def _raise_if_not_ready(self, snapshot: bytes) -> None:
         not_ready = NOT_READY_PREFIX_PATTERN.search(snapshot, self._not_ready_scan_start)
         if not_ready is not None:
+            for pattern, prefix in (
+                (ASSISTANT_NOT_READY_CONTEXT_PATTERN, "not-ready-assistant-"),
+                (READINESS_NOT_READY_CONTEXT_PATTERN, "not-ready-"),
+            ):
+                # A diagnostic annotates only its immediately following failure;
+                # stale or unrelated markers cannot reclassify another failure.
+                diagnostic = pattern.search(snapshot)
+                if diagnostic is not None and diagnostic.end() == not_ready.end():
+                    code = diagnostic.group(1).decode("ascii")
+                    raise ClosedFailure("readiness", prefix + code)
             diagnostic = TAURI_NOT_READY_CONTEXT_PATTERN.search(snapshot)
             if diagnostic is not None and diagnostic.end() == not_ready.end():
                 stage = diagnostic.group(1).decode("ascii")
@@ -2728,10 +2813,7 @@ def run_companion(
                     aggregate,
                 )
             except ClosedFailure as diagnostic_error:
-                if (
-                    diagnostic_error.stage == "readiness"
-                    and diagnostic_error.code == "not-ready"
-                ):
+                if diagnostic_error.stage == "readiness":
                     raise
                 reason = "diagnostic-unavailable"
             except CaptureLimitError:

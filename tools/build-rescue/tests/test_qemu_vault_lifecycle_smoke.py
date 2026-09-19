@@ -992,6 +992,164 @@ exec /bin/bash --noprofile --norc -i
             )
 
 
+class ReadinessDiagnosticTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def console(self) -> Iterator[tuple[int, object]]:
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        capture = controller.BoundedCapture(4096, [])
+        console = controller.SerialConsole(slave, capture, lambda: None)
+        try:
+            yield master, console
+        finally:
+            console.close()
+            os.close(master)
+            capture.wipe()
+
+    def classify(self, transcript: bytes) -> str:
+        with self.console() as (master, console):
+            os.write(master, transcript)
+            with self.assertRaises(controller.ClosedFailure) as failure:
+                console.wait_line(
+                    b"KERNAID_TEST_NEVER_READY",
+                    start=0,
+                    deadline=time.monotonic() + 0.05,
+                    stage="readiness",
+                )
+        self.assertEqual(failure.exception.stage, "readiness")
+        return failure.exception.code
+
+    def guest_fail(self, fail_function: str, reason: str) -> bytes:
+        completed = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                fail_function.replace("/dev/ttyS0", "/dev/stdout") + 'fail "$1"\n',
+                "ready-check-test",
+                reason,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr, b"")
+        return completed.stdout
+
+    def test_guest_fail_exports_only_exact_source_owned_codes(self) -> None:
+        source = READY_CHECK.read_text()
+        fail_function = (
+            "fail() {"
+            + source.split("fail() {", 1)[1].split("\n}\n", 1)[0]
+            + "\n}\n"
+        )
+        mappings = re.findall(
+            r'"([^"\n]+)"\) readiness_code=([a-z0-9-]+) ;;', fail_function
+        )
+        self.assertEqual(
+            {code.encode() for _, code in mappings},
+            set(controller.READINESS_FAILURE_CODES),
+        )
+        self.assertEqual(len(mappings), len(controller.READINESS_FAILURE_CODES))
+        declared_reasons = set(re.findall(r'fail "([^"\n]+)"', source))
+        for reason, code in mappings:
+            with self.subTest(code=code):
+                self.assertIn(reason, declared_reasons)
+                self.assertEqual(
+                    self.classify(self.guest_fail(fail_function, reason)),
+                    "not-ready-" + code,
+                )
+        # A near-match, newline injection or arbitrary text cannot acquire a
+        # known code, even when it contains a valid reason as a substring.
+        for reason in (
+            "private-reason=must-not-escape",
+            "vault lifecycle socket is not active private-suffix",
+            "vault lifecycle socket is not active\nprivate-suffix",
+        ):
+            with self.subTest(reason=reason):
+                transcript = self.guest_fail(fail_function, reason)
+                self.assertNotIn(
+                    b"KERNAID_RESCUE_READINESS_FAILURE_V1", transcript
+                )
+                self.assertEqual(self.classify(transcript), "not-ready")
+
+    def test_readiness_code_requires_exact_adjacent_context(self) -> None:
+        marker = b"KERNAID_RESCUE_READINESS_FAILURE_V1 code=vault-startup-worker-probe"
+        failure = controller.NOT_READY_LINE_PREFIX + b" private-reason=must-not-escape\r\n"
+        for prefix in (
+            b"\r\n" + marker + b"\r\n\r\n",
+            b"\n" + marker + b"\n",
+        ):
+            self.assertEqual(
+                self.classify(prefix + failure), "not-ready-vault-startup-worker-probe"
+            )
+        for prefix in (
+            b"midline " + marker + b"\r\n\r\n",
+            b"\r\n" + marker + b"-private-suffix\r\n\r\n",
+            b"\r\n" + marker + b"\r\nunrelated line\r\n",
+            b"\r\nKERNAID_RESCUE_READINESS_FAILURE_V1 code=private-code\r\n\r\n",
+            b"\r\n" + marker + b"\r\n\r\n\r\n",
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.classify(prefix + failure), "not-ready")
+        # A failure marker cannot stand in for READY or override an earlier
+        # generic NOT_READY with a later, more specific diagnostic.
+        self.assertEqual(self.classify(b"\n" + marker + b"\n"), "timeout")
+        self.assertEqual(
+            self.classify(b"\n" + failure + b"\n" + marker + b"\n" + failure),
+            "not-ready",
+        )
+
+    def test_readiness_code_survives_serial_chunk_boundaries(self) -> None:
+        transcript = (
+            b"\r\nKERNAID_RESCUE_READINESS_FAILURE_V1 code=inventory-http\r\n\r\n"
+            + controller.NOT_READY_LINE_PREFIX
+        )
+        # No reason text or trailing newline is required to reject readiness.
+        for split in range(1, len(transcript)):
+            with self.subTest(split=split), self.console() as (_, console):
+                console._raise_if_not_ready(transcript[:split])
+                with self.assertRaises(controller.ClosedFailure) as failure:
+                    console._raise_if_not_ready(transcript)
+                self.assertEqual(failure.exception.code, "not-ready-inventory-http")
+
+    def test_assistant_diagnostic_is_preserved_without_payloads(self) -> None:
+        assistant_source = READY_CHECK.with_name("assistant_ready_check.py").read_bytes()
+        self.assertEqual(
+            set(re.findall(rb'stage = "([a-z0-9-]+)"', assistant_source)),
+            set(controller.ASSISTANT_FAILURE_STAGES),
+        )
+        failure = controller.NOT_READY_LINE_PREFIX + b" private-response=must-not-escape\r\n"
+        for stage in controller.ASSISTANT_FAILURE_STAGES:
+            for readiness_marker in (
+                b"",
+                b"KERNAID_RESCUE_READINESS_FAILURE_V1 code=assistant-probe\r\n\r\n",
+            ):
+                with self.subTest(stage=stage, marker=readiness_marker):
+                    transcript = (
+                        b"\r\nKERNAID_RESCUE_ASSISTANT_FAILURE_V1 stage=" + stage
+                        + b"\r\n\r\n" + readiness_marker + failure
+                    )
+                    self.assertEqual(
+                        self.classify(transcript), "not-ready-assistant-" + stage.decode()
+                    )
+        for prefix in (
+            b"midline KERNAID_RESCUE_ASSISTANT_FAILURE_V1 stage=search\r\n\r\n",
+            b"\r\nKERNAID_RESCUE_ASSISTANT_FAILURE_V1 stage=private-stage\r\n\r\n",
+            b"\r\nKERNAID_RESCUE_ASSISTANT_FAILURE_V1 stage=search\r\nunrelated line\r\n",
+        ):
+            self.assertEqual(self.classify(prefix + failure), "not-ready")
+        self.assertEqual(
+            self.classify(
+                b"\r\nKERNAID_RESCUE_ASSISTANT_FAILURE_V1 stage=search\r\n\r\n"
+                b"KERNAID_RESCUE_READINESS_FAILURE_V1 code=inventory-http\r\n\r\n" + failure
+            ),
+            "not-ready-inventory-http",
+        )
+
+
 class ResponseParserTests(unittest.TestCase):
     def test_exact_status_wrong_unlock_success_and_lock(self) -> None:
         self.assertEqual(
@@ -1397,6 +1555,44 @@ class UnlockDiagnosticTests(unittest.TestCase):
         invocation_id="0123456789abcdef0123456789abcdef",
         request_state_version=10,
     )
+
+    def test_readiness_failure_is_not_hidden_by_unlock_diagnostics(self) -> None:
+        console = mock.Mock()
+        console.capture.snapshot.return_value = b""
+        begin = mock.Mock()
+        begin.end.return_value = 0
+        prompt = mock.Mock()
+        prompt.start.return_value = 0
+        end = mock.Mock()
+        end.group.return_value = b"1"
+        end.start.return_value = 0
+        for code in (
+            "not-ready",
+            "not-ready-vault-startup-worker-probe",
+            "not-ready-assistant-search",
+            "not-ready-tauri-renderer",
+        ):
+            console.wait_regex.side_effect = [begin, prompt, end]
+            with (
+                self.subTest(code=code),
+                mock.patch.object(
+                    controller, "parse_companion_response",
+                    side_effect=controller.UnlockRemoteFailure("unlock-remote-io-failed", 12),
+                ),
+                mock.patch.object(
+                    controller, "collect_unlock_diagnostic",
+                    side_effect=controller.ClosedFailure("readiness", code),
+                ),
+                self.assertRaises(controller.ClosedFailure) as failure,
+            ):
+                controller.run_companion(
+                    console, "unlock", "correct-unlock", 0,
+                    time.monotonic() + 10, bytearray(b"TEST_ONLY_SECRET"),
+                    self.expectation,
+                )
+            self.assertEqual(
+                (failure.exception.stage, failure.exception.code), ("readiness", code)
+            )
 
     def run_closed_shell_classifier(
         self,
