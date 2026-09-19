@@ -136,6 +136,7 @@ export function RescueConnectionWizard({
     setSurface(next.config.surface);
     setBaseUrl(next.config.baseUrl);
     setModel(next.config.model);
+    setContextConsent(undefined);
     setApiKey("");
     setVerified(false);
     setMessages([]);
