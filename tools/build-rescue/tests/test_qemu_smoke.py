@@ -940,7 +940,7 @@ class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
         main_install = (
             "          sudo apt-get install -y \\\n"
             "            build-essential cryptsetup dosfstools e2fsprogs gdisk mtools ntfs-3g \\\n"
-            "            ovmf qemu-system-x86 shellcheck squashfs-tools udev util-linux xorriso\n"
+            "            gnupg ovmf qemu-system-x86 shellcheck squashfs-tools udev util-linux xorriso\n"
         )
         lifecycle_install = (
             "          sudo apt-get install -y \\\n"
