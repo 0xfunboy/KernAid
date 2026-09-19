@@ -47,6 +47,14 @@ The repair candidate `01cf8fe` failed UEFI crypttab provider proof. These gates
 stay open until a new exact artifact passes; they cannot be inferred from a
 green build or from unrelated older evidence.
 
+**Gemrouter follow-up:** after the owner's upstream gateway fix, direct HTTP
+and the actual Pi daemon are verified from this VPS with `/v1`, explicit
+Gemini backend, non-streaming requests and 120 s deadlines. Startup model
+discovery is cached; no retries or backend/model fallback are enabled. The
+live Pi → SearXNG → answer chain also passed. Carry this source update into
+the next exact-image cohort; existing ISO downloads are not modified by a
+daemon restart. See [verification details](RESCUE_NETWORK_FIRST.md).
+
 **Workspace:** `/home/funboy/kernaid` is the only active source checkout.
 Integrated scratch worktrees have been removed; live artifacts remain in
 `/home/funboy/KernAid-dist`, unique historical evidence in

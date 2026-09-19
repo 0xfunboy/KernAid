@@ -4293,7 +4293,7 @@ class RescueHandler(SimpleHTTPRequestHandler):
                 or self.headers.get("Transfer-Encoding") is not None):
             self.send_error(403)
             return
-        self._arm_request_deadline(80)
+        self._arm_request_deadline(135)
         try:
             lengths = self.headers.get_all("Content-Length", [])
             if len(lengths) != 1 or not lengths[0].isdigit():
@@ -4307,7 +4307,7 @@ class RescueHandler(SimpleHTTPRequestHandler):
             }:
                 raise ValueError()
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
-                peer.settimeout(72)
+                peer.settimeout(130)
                 peer.connect("/run/kernaid-assistant/assistant.sock")
                 peer.sendall(json.dumps(request).encode() + b"\n")
                 chunks = bytearray()

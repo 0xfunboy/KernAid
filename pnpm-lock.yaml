@@ -237,6 +237,9 @@ importers:
 
   services/rescue-assistant:
     dependencies:
+      '@earendil-works/pi-ai':
+        specifier: 0.80.10
+        version: 0.80.10(ws@8.21.3)(zod@4.6.5)
       '@earendil-works/pi-coding-agent':
         specifier: 0.80.10
         version: 0.80.10(ws@8.21.3)(zod@4.6.5)

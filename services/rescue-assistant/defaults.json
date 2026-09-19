@@ -3,7 +3,7 @@
   "surfaces": {
     "gemrouter": {
       "label": "Gemrouter",
-      "baseUrl": "https://gemr.airewardrop.xyz",
+      "baseUrl": "https://gemr.airewardrop.xyz/v1",
       "model": "gemini-3.8-flash",
       "nativeTools": false
     },

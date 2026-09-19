@@ -18,6 +18,7 @@ type AssistantStatus = {
   config: Surface & { surface: string };
   credentialPresent: boolean;
   verified: boolean;
+  modelDiscovery?: { state: string; models: string[] };
 };
 type Message = { role: "You" | "KernAid"; text: string };
 
@@ -30,7 +31,7 @@ async function call<T>(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action, ...fields }),
     cache: "no-store",
-    signal: AbortSignal.timeout(78_000),
+    signal: AbortSignal.timeout(140_000),
   });
   const data = await response.json();
   if (!response.ok || !data.ok)
@@ -57,7 +58,7 @@ export function RescueConnectionWizard({
   const [ssid, setSsid] = useState("");
   const [wifiPassword, setWifiPassword] = useState("");
   const [surface, setSurface] = useState("gemrouter");
-  const [baseUrl, setBaseUrl] = useState("https://gemr.airewardrop.xyz");
+  const [baseUrl, setBaseUrl] = useState("https://gemr.airewardrop.xyz/v1");
   const [model, setModel] = useState("gemini-3.8-flash");
   const [apiKey, setApiKey] = useState("");
   const [models, setModels] = useState<string[]>([]);
@@ -107,6 +108,7 @@ export function RescueConnectionWizard({
       setBaseUrl(next.config.baseUrl);
       setModel(next.config.model);
       setVerified(next.verified);
+      setModels(next.modelDiscovery?.models || []);
     }
     const result = await call<{ adapters: Adapter[] }>("networks");
     setAdapters(result.adapters);
@@ -134,6 +136,7 @@ export function RescueConnectionWizard({
     });
     setStatus(next);
     setSurface(next.config.surface);
+    setModels(next.modelDiscovery?.models || []);
     setBaseUrl(next.config.baseUrl);
     setModel(next.config.model);
     setContextConsent(undefined);

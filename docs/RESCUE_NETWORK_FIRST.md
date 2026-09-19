@@ -33,7 +33,7 @@ bounded request still reports failures. This is not a verified fix of that PC.
    always available. Disk inventory/discovery waits for this step to finish.
 2. Choose Gemrouter (default), OpenAI, DeepSeek, Gemini's OpenAI-compatible
    surface or a custom HTTPS base URL. Fetch `/models` or enter a model. Default:
-   `gemini-3.8-flash` at `https://gemr.airewardrop.xyz`.
+   `gemini-3.8-flash` at `https://gemr.airewardrop.xyz/v1`.
 3. Verify an actual response and talk to Pi before selecting a disk. The
    assistant stays accessible during diagnosis. Only the conversation and an
    explicitly reviewed optional summary go to the model; files are not uploaded.
@@ -84,7 +84,42 @@ Wi-Fi behavior still require qualification.
 Pi SDK is pinned to `@earendil-works/pi-coding-agent` `0.80.10`. Sessions are
 in-memory, with project context/extensions disabled and no built-in shell,
 read, edit or write tools. Native-tool-capable providers receive only
-`web_search`; model work is bounded to four turns and 60 seconds per request.
+`web_search`; model work is bounded to four turns and 120 seconds per question,
+including any search turns.
+
+The Gemrouter profile uses a dedicated Pi transport because the SDK's stock
+OpenAI Completions adapter requests streaming. The verified gateway contract is:
+
+| Setting | KernAid value |
+| --- | --- |
+| API base | `https://gemr.airewardrop.xyz/v1` |
+| Completion | `POST /v1/chat/completions`, `stream: false` |
+| Authentication | Endpoint-bound `Authorization: Bearer` service credential |
+| Backend | `x-gemrouter-backend: gemini-api` |
+| Model | `gemini-3.8-flash`, no automatic model/backend fallback |
+| Output limit | `max_tokens: 2048` for normal answers; 64 only in the direct probe |
+| Deadlines | 10 s DNS/TCP/TLS connection, 120 s complete HTTP request |
+| Budget | At most 2 in-flight HTTP requests and 30 starts per rolling minute, process-wide |
+| Retries | None; exceeded budgets fail locally instead of queuing |
+| Discovery | Once at service startup, cached; explicit Load models refresh is available |
+
+The transport appends `/models` or `/chat/completions` to the selected base,
+never another `/v1`. It sends no Origin, cookie, OAuth, Codex credentials,
+thinking parameters or native tools, and follows no redirects. Request and
+response JSON are bounded to 512 KiB. Pi still owns the conversation; the
+adapter is not a replacement harness. Other provider profiles retain their
+existing compatible transport.
+
+Startup discovery runs in the background and does not block local status,
+network selection or offline diagnosis. Successful results are reused when
+selecting another model on the same endpoint/key. A changed provider, endpoint
+or credential invalidates them; a late response cannot populate a new profile.
+After an offline startup, connecting an adapter or explicitly configuring the
+provider can start a fresh discovery. Chat itself never discovers models.
+The local IPC, HTTP relay and browser deadlines are 125, 135 and 140 seconds
+(relay peer timeout 130 s), so they do not cut off a valid 120 s model request.
+The incoming browser Origin/Host check remains mandatory: it is distinct from
+the outgoing server-to-server request, which has no Origin header.
 
 The live Gemrouter endpoint rejects native tools with HTTP 400:
 `Tool calling is not supported on this router surface`. Its profile instead
@@ -108,7 +143,7 @@ References: [Pi SDK](https://github.com/earendil-works/pi/blob/main/packages/cod
 Endpoint/model defaults are committed; real keys are not. The supplied test key
 is stored at `/home/funboy/.config/kernaid-assistant/gemrouter.key`, mode 0600,
 and loaded into the development service through systemd `LoadCredential`.
-Rotate it by editing this file and restarting
+After issuing a replacement in Gemrouter, rotate it by editing this file and restarting
 `systemctl --user restart kernaid-assistant.service`.
 Keys entered through the wizard live only in memory. Endpoint changes discard
 the prior credential and conversation; an existing key is never forwarded to
@@ -150,15 +185,28 @@ The image-generation endpoint is not used by this diagnostic assistant.
   `KernAid ready` using that model.
 - SearXNG returned live NetworkManager documentation links. The initial
   DuckDuckGo CAPTCHA was handled by adding independent search engines.
-- Later Gemrouter requests timed out. The complete live Pi→search→answer chain
-  still needs confirmation once upstream is responsive; local tests prove the
-  protocol, not remote reliability.
+- Earlier Gemrouter requests timed out. This was superseded by the live
+  verification below after the owner reported an upstream production fix.
 - On 19 September the synthetic, consented-summary Pi probe reached its 60 s
   deadline. Direct requests outside Pi also timed out: minimal non-streaming
   `/chat/completions` at 20 s and `/models` at 10 s, without a response status.
-  Thus the failure is not exclusively a Pi streaming issue; endpoint/network
-  reachability from this machine remains an external gate. No unsupported
-  compatibility change or automatic model substitution was made. Timeout now
-  tells the user to retry or continue offline, without implying an invalid key.
+  This established that the earlier failure was not exclusively Pi streaming.
+  Timeout still tells the user to retry or continue offline, without implying
+  an invalid key.
+- After the upstream fix reported as `1ef520d`, this VPS verified the supplied
+  non-streaming Gemini contract: `/v1/models` HTTP 200 in 1.167 s, preferred
+  model present (`req-88`); `/v1/chat/completions` HTTP 200 in 5.068 s,
+  `KERNAID_TEST_OK`, backend `gemini-api`, 13 total tokens (`req-89`).
+- The restarted **actual KernAid Unix-socket service**, using Pi and the new
+  transport, answered `KERNAID_TEST_OK` in 4.800 s. Startup discovery was ready
+  and the service reported `verified: true`. A subsequent live Pi → SearXNG →
+  Pi question returned the official NetworkManager nmcli documentation URL
+  in 20.299 s with exactly one search. No retry, fallback or key rotation was
+  used. These are VPS checks, not physical USB or exact-ISO evidence.
+- Focused transport/runtime checks cover non-streaming payloads, actual Pi
+  provider dispatch, header isolation, deadlines, cancellation, JSON bounds,
+  quota enforcement and discovery caching: 24 passed, plus 3 local relay
+  boundary/readiness checks. The production Desk build and isolated production
+  assistant bundle import passed with Node 24.18.0 and the frozen lockfile.
 - New ISO/boot qualification, physical Wi-Fi and the reported disk-selection
   issue remain to be tested. Existing ISO/Vault/repair limitations still apply.

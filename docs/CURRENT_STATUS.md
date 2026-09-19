@@ -37,12 +37,17 @@ assistant bundle imports successfully and focused contract/UI/runtime checks
 plus the Desk build pass. It will need a new exact-image cohort after review
 of the already-running build; no duplicate ISO run was started here.
 
-Gemrouter live qualification is still open: the 19 September synthetic Pi
-request timed out at 60 s, and direct non-streaming chat (20 s) and model
-catalog (10 s) requests also timed out without response headers. This is not
-established as a Pi-only issue or an invalid credential. The default model is
-unchanged; offline operation remains the fallback while endpoint/network
-availability from this machine is unresolved.
+Gemrouter connectivity is now verified **from this VPS**, following the
+upstream fix reported by the owner. The default is `/v1`, explicit
+`x-gemrouter-backend: gemini-api`, `gemini-3.8-flash`, non-streaming completion,
+10 s connection / 120 s request deadline, no retries and cached startup model
+discovery. A dedicated transport keeps the actual Pi harness while avoiding
+its stock adapter's forced streaming. Direct HTTP returned `KERNAID_TEST_OK`
+in 5.068 s (13 tokens); the restarted KernAid daemon returned it in 4.800 s.
+The live Pi → SearXNG → answer chain passed in 20.299 s with one search.
+The existing private key remains unchanged. This closes the earlier VPS
+connectivity block, not exact-ISO, physical Wi-Fi or broader product gates.
+See [verified transport contract](RESCUE_NETWORK_FIRST.md#harness-and-search).
 
 The canonical checkout is now the only active worktree. Seventeen clean,
 patch-integrated scratch worktrees and their reproducible caches were removed;

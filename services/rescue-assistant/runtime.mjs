@@ -10,6 +10,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { parseAssistantContext } from "@kernaid/assistant-context";
+import {
+  GEMROUTER_API,
+  createGemrouterTransport,
+} from "./gemrouter-transport.mjs";
 
 export const defaults = JSON.parse(
   await fs.readFile(new URL("./defaults.json", import.meta.url), "utf8"),
@@ -224,7 +228,7 @@ export class AssistantRuntime {
     stateDir,
     keyFile,
     searchUrl = "http://127.0.0.1:8888/search",
-    timeoutMs = 60_000,
+    timeoutMs = 120_000,
   }) {
     this.stateDir = stateDir;
     this.keyFile = keyFile;
@@ -238,6 +242,8 @@ export class AssistantRuntime {
     this.busy = false;
     this.session = undefined;
     this.verified = false;
+    this.discovery = undefined;
+    this.gemrouterTransport = undefined;
   }
   async initialize() {
     await fs.mkdir(this.stateDir, { recursive: true, mode: 0o700 });
@@ -270,6 +276,10 @@ export class AssistantRuntime {
       verified: this.verified,
       searchEnabled: Boolean(this.searchUrl),
       harness: "Pi",
+      modelDiscovery: {
+        state: this.discovery?.state || "idle",
+        models: this.discovery?.models || [],
+      },
     };
   }
   async configure(input) {
@@ -304,6 +314,12 @@ export class AssistantRuntime {
       baseUrl,
       model: input.model,
     };
+    if (
+      this.discovery?.surface !== input.surface ||
+      this.discovery?.baseUrl !== baseUrl ||
+      this.discovery?.key !== this.credential()
+    )
+      this.discovery = undefined;
     this.verified = false;
     if (this.session) {
       this.session.dispose();
@@ -311,18 +327,64 @@ export class AssistantRuntime {
     }
     return this.status();
   }
-  async models() {
+  transport(baseUrl = this.config.baseUrl) {
+    if (this.gemrouterTransport?.baseUrl !== baseUrl) {
+      this.gemrouterTransport = {
+        baseUrl,
+        client: createGemrouterTransport({ baseUrl }),
+      };
+    }
+    return this.gemrouterTransport.client;
+  }
+  async fetchModels(config, key) {
+    return config.surface === "gemrouter"
+      ? this.transport(config.baseUrl).models({ apiKey: key })
+      : boundedJson(config.baseUrl + "/models", {
+          headers: { Authorization: `Bearer ${key}` },
+        });
+  }
+  startDiscovery() {
+    // Startup/configuration discovery is non-blocking: offline diagnosis and
+    // adapter selection must remain available while the network comes up.
+    if (
+      this.credential() &&
+      (!this.discovery || this.discovery.state === "error")
+    )
+      void this.models({ refresh: true }).catch(() => {});
+  }
+  async models({ refresh = false } = {}) {
     const key = this.credential();
     if (!key) throw new Error("Enter an API key for this provider.");
-    const data = await boundedJson(this.config.baseUrl + "/models", {
-      headers: { Authorization: `Bearer ${key}` },
-    });
-    return {
-      models: (data.data || [])
-        .filter((item) => typeof item.id === "string" && item.id.length <= 160)
-        .slice(0, 256)
-        .map((item) => item.id),
+    if (this.discovery && (this.discovery.state === "loading" || !refresh))
+      return this.discovery.promise;
+    const record = {
+      surface: this.config.surface,
+      baseUrl: this.config.baseUrl,
+      key,
+      state: "loading",
+      models: [],
     };
+    this.discovery = record;
+    record.promise = this.fetchModels({ ...this.config }, key)
+      .then((data) => {
+        if (!Array.isArray(data?.data))
+          throw new Error("Invalid model discovery response.");
+        record.models = data.data
+          .filter(
+            (item) => typeof item?.id === "string" && item.id.length <= 160,
+          )
+          .slice(0, 256)
+          .map((item) => item.id);
+        record.state = "ready";
+        return { models: record.models };
+      })
+      .catch(() => {
+        record.state = "error";
+        throw new Error(
+          "Model discovery unavailable. Check connectivity or retry Load models.",
+        );
+      });
+    return record.promise;
   }
   async search(query, signal) {
     if (!this.searchUrl) throw new Error("Web search is not configured.");
@@ -356,7 +418,11 @@ export class AssistantRuntime {
     });
     modelRuntime.registerProvider("kernaid", {
       baseUrl: config.baseUrl,
-      api: "openai-completions",
+      api:
+        config.surface === "gemrouter" ? GEMROUTER_API : "openai-completions",
+      ...(config.surface === "gemrouter"
+        ? { streamSimple: this.transport().streamSimple }
+        : {}),
       authHeader: true,
       models: [
         {

@@ -112,6 +112,67 @@ test("Gemrouter text protocol accepts only the bounded search operation", () => 
     assert.equal(parseSearchRequest(text), undefined);
 });
 
+test("model discovery is shared and cached, not repeated for model selection", async () => {
+  const runtime = new AssistantRuntime({ stateDir: "/unused", searchUrl: "" });
+  let requests = 0;
+  let complete;
+  runtime.fetchModels = async () => {
+    requests++;
+    return new Promise((resolve) => {
+      complete = resolve;
+    });
+  };
+  await runtime.configure({
+    surface: "gemrouter",
+    model: "test",
+    apiKey: "synthetic-test-only",
+  });
+  runtime.startDiscovery();
+  assert.equal(runtime.status().modelDiscovery.state, "loading");
+  const pending = runtime.models({ refresh: true });
+  assert.equal(requests, 1);
+  complete({ data: [null, { id: "test" }, { id: 123 }] });
+  assert.deepEqual(await pending, { models: ["test"] });
+  await runtime.configure({ surface: "gemrouter", model: "another-model" });
+  runtime.startDiscovery();
+  assert.deepEqual(await runtime.models(), { models: ["test"] });
+  assert.equal(requests, 1);
+  assert.ok(!JSON.stringify(runtime.status()).includes("synthetic-test-only"));
+  await runtime.configure({
+    surface: "gemrouter",
+    model: "test",
+    apiKey: "synthetic-new-key",
+  });
+  assert.equal(runtime.status().modelDiscovery.state, "idle");
+});
+
+test("a late discovery response cannot populate a different endpoint", async () => {
+  const runtime = new AssistantRuntime({ stateDir: "/unused", searchUrl: "" });
+  let complete;
+  runtime.fetchModels = async () =>
+    new Promise((resolve) => {
+      complete = resolve;
+    });
+  await runtime.configure({
+    surface: "gemrouter",
+    model: "test",
+    apiKey: "synthetic-test-only",
+  });
+  const pending = runtime.models();
+  await runtime.configure({
+    surface: "custom",
+    baseUrl: "https://different.example/v1",
+    model: "test",
+  });
+  complete({ data: [{ id: "old-provider-model" }] });
+  await pending;
+  assert.deepEqual(runtime.status().modelDiscovery, {
+    state: "idle",
+    models: [],
+  });
+  assert.equal(runtime.status().credentialPresent, false);
+});
+
 test("Gemrouter request goes through bounded search and returns a final answer", async () => {
   const runtime = new AssistantRuntime({ stateDir: "/unused" });
   let prompts = 0;

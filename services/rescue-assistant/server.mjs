@@ -38,12 +38,18 @@ async function dispatch(request) {
         return await networks();
       case "wifi":
         return await wifi(request.adapter);
-      case "connect":
-        return await connectNetwork(request);
-      case "configure":
-        return await runtime.configure(request);
+      case "connect": {
+        const result = await connectNetwork(request);
+        runtime.startDiscovery();
+        return result;
+      }
+      case "configure": {
+        await runtime.configure(request);
+        runtime.startDiscovery();
+        return runtime.status();
+      }
       case "models":
-        return await runtime.models();
+        return await runtime.models({ refresh: true });
       case "chat":
         return await runtime.chat(
           request.message,
@@ -68,7 +74,7 @@ try {
   if (e.code !== "ENOENT") throw e;
 }
 const server = net.createServer((socket) => {
-  socket.setTimeout(75_000, () => socket.destroy());
+  socket.setTimeout(125_000, () => socket.destroy());
   let data = Buffer.alloc(0);
   let received = false;
   socket.on("error", () => {});
@@ -104,4 +110,5 @@ server.maxConnections = 8;
 server.listen(socketPath, async () => {
   await fs.chmod(socketPath, 0o660);
   console.log("KernAid assistant ready (local Unix socket)");
+  runtime.startDiscovery();
 });

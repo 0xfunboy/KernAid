@@ -6,16 +6,18 @@
   "files": [
     "server.mjs",
     "runtime.mjs",
+    "gemrouter-transport.mjs",
     "defaults.json"
   ],
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check runtime.mjs",
+    "check": "node --check server.mjs && node --check runtime.mjs && node --check gemrouter-transport.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@kernaid/assistant-context": "workspace:*",
     "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-ai": "0.80.10",
     "typebox": "1.1.38"
   }
 }
