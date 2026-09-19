@@ -15,6 +15,13 @@ wizard configuration restoration and production Pi/SearXNG packaging. The
 local runtime checks and Desk build passed; a new exact-image qualification
 is still required before changing the stable download.
 
+Active candidate: source `53afa5acbea219b4c2e4f5cc347da33884bc2544`,
+[Rescue run 35412459885](https://github.com/0xfunboy/KernAid/actions/runs/35412459885),
+dispatched on 19 September and **in progress at this checkpoint**. Only this
+Rescue cohort was dispatched; unrelated platform rebuilds were not started.
+The new guest gate checks the live Pi relay, network enumeration and local
+SearXNG health. No new artifact is promoted or available for download yet.
+
 The canonical checkout is now the only active worktree. Seventeen clean,
 patch-integrated scratch worktrees and their reproducible caches were removed;
 unique historical probes/logs were archived, not discarded. The site's live
