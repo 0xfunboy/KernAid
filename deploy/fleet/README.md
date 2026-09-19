@@ -157,11 +157,17 @@ directory contains exactly `fleet.sqlite`, `manifest.json` and `manifest.sig`.
 The canonical manifest schema is
 `dev.kernaid.fleet.database-backup-manifest.v1`; it binds the exact database
 SHA-256 and byte count, SQLite `user_version`, complete sorted table inventory
-and RFC 3339 creation time. Its Ed25519 input is:
+and RFC 3339 creation time.
 
-Schema v11 adds commercial-license, retained-clock, seat and digest-only audit
-tables without changing this backup format. Online backup, verify and restore
-therefore cover the licensing state and preserve its exact schema version.
+Schemas through v13 preserve this backup format. Online backup, verify and
+restore cover the complete table inventory, including commercial-license,
+retained-clock, seat and digest-only audit state, and preserve the exact schema
+version. The [19 September 2026 schema-v13 drill](restore-drill-2026-09-19.md)
+records offline signature verification and an exact-byte disposable restore of
+an existing scheduled bundle; it does not qualify production cutover or
+off-host secret recovery.
+
+The manifest's Ed25519 input is:
 
 ```text
 kernaid:fleet:database-backup:v1\0 || canonical manifest JSON
@@ -199,8 +205,10 @@ node deploy/fleet/database-lifecycle.mjs restore \
 schema inspection. It is explicitly not a signed backup verification mode;
 `verify` and `restore` never accept a bare legacy database.
 
-Stop Fleet, point `KERNAID_FLEET_DB_PATH` at the verified restored file, start
-Fleet and require `/healthz`, tenant authentication and inventory visibility.
+The offline drill above never requires stopping or reconfiguring live Fleet.
+For a separately authorized production recovery, stop Fleet, point
+`KERNAID_FLEET_DB_PATH` at the verified restored file, start Fleet and require
+`/healthz`, tenant authentication and inventory visibility.
 Keep the previous database untouched until that validation succeeds. The root
 token is intentionally outside SQLite and must be backed up through the
 deployment secret store, not copied into a database archive.

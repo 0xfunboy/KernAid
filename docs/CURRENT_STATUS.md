@@ -22,6 +22,20 @@ Rescue cohort was dispatched; unrelated platform rebuilds were not started.
 The new guest gate checks the live Pi relay, network enumeration and local
 SearXNG health. No new artifact is promoted or available for download yet.
 
+The subsequent source batch adds an explicitly previewed, per-question
+inspection summary for Pi, with a closed identifier-free schema and isolated
+conversation. It also preserves static readiness failure codes in Vault
+lifecycle logs. Neither change is in the running `53afa5a` image. The previous
+Vault failure's detailed artifact has expired; its exact cause remains open,
+not claimed fixed by the diagnostic improvement.
+
+Gemrouter live qualification is still open: the 19 September synthetic Pi
+request timed out at 60 s, and direct non-streaming chat (20 s) and model
+catalog (10 s) requests also timed out without response headers. This is not
+established as a Pi-only issue or an invalid credential. The default model is
+unchanged; offline operation remains the fallback while endpoint/network
+availability from this machine is unresolved.
+
 The canonical checkout is now the only active worktree. Seventeen clean,
 patch-integrated scratch worktrees and their reproducible caches were removed;
 unique historical probes/logs were archived, not discarded. The site's live
@@ -226,6 +240,11 @@ hardware-backed secret storage or a physical production endpoint.
   and left the live WAL database untouched.
 - The offline verify/restore drill is green against a disposable destination;
   overwrite, tamper, wrong-key, sidecar and symlink paths remain fail-closed.
+- On 19 September the real scheduled 18 September schema-v13 bundle was
+  independently signature-verified and restored byte-for-byte: 32 tables, full
+  integrity check and zero foreign-key failures. The live service stayed
+  healthy and untouched. [Exact restore evidence](../deploy/fleet/restore-drill-2026-09-19.md)
+  distinguishes this software gate from unqualified clean-host recovery/cutover.
 - These software gates do not replace physical endpoint, identity-store,
   publisher-signing or provider-account evidence.
 

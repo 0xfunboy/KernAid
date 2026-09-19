@@ -197,9 +197,13 @@ anchors; all issuer private keys remain outside its filesystem view.
 The live service also has a persistent scheduled backup. Each online SQLite
 copy is forced into standalone journal mode, checked for integrity/foreign-key
 violations, bound into a canonical manifest and signed with the existing
-service-receipt Ed25519 key. The last explicitly recorded independent restore
-verification covers a schema-v12 bundle from 1 September 2026; the live schema
-is now v13, so that older evidence is not presented as a v13 restore result.
+service-receipt Ed25519 key. The 19 September independent offline drill verified
+and restored the scheduled 18 September **schema-v13** bundle to a disposable
+destination: exact signed bytes, 32 tables, full SQLite integrity, zero foreign-key
+failures and overwrite rejection. The live database was not changed. See
+[exact evidence](../deploy/fleet/restore-drill-2026-09-19.md).
+Clean-host secret recovery, authenticated application cutover, off-host durability
+and measured RTO/RPO remain separate operational gates.
 Root and tenant credentials remain owner-only and outside source control.
 
 The automated native package lifecycle is green for the exact current-source

@@ -27,7 +27,7 @@ const lifecycle = join(directory, "database-lifecycle.mjs");
 const scheduled = join(directory, "scheduled-backup.mjs");
 const domain = Buffer.from("kernaid:fleet:database-backup:v1\0", "utf8");
 
-test("signed Fleet bundle verifies offline and restores exact bytes", (t) => {
+test("signed Fleet schema-v13 bundle verifies offline and restores exact bytes", (t) => {
   const fixture = createFixture(t);
   const bundle = join(fixture.backups, "manual.backup");
   const created = run(lifecycle, [
@@ -48,7 +48,7 @@ test("signed Fleet bundle verifies offline and restores exact bytes", (t) => {
     manifest.schema,
     "dev.kernaid.fleet.database-backup-manifest.v1",
   );
-  assert.equal(manifest.database.sqliteUserVersion, 10);
+  assert.equal(manifest.database.sqliteUserVersion, 13);
   assert.deepEqual(manifest.database.tables, [
     "assets",
     "devices",
@@ -78,6 +78,7 @@ test("signed Fleet bundle verifies offline and restores exact bytes", (t) => {
 
   const verified = run(lifecycle, ["verify", bundle, fixture.trustAnchor]);
   assert.equal(verified.status, 0, verified.stderr);
+  assert.equal(JSON.parse(verified.stdout).userVersion, 13);
   assert.equal(
     JSON.parse(verified.stdout).databaseSha256,
     receipt.databaseSha256,
@@ -91,6 +92,7 @@ test("signed Fleet bundle verifies offline and restores exact bytes", (t) => {
     restored,
   ]);
   assert.equal(restore.status, 0, restore.stderr);
+  assert.equal(JSON.parse(restore.stdout).userVersion, 13);
   assert.deepEqual(readFileSync(restored), databaseBytes);
   const beforeReplay = readFileSync(restored);
   const replay = run(lifecycle, [
@@ -243,7 +245,7 @@ function createFixture(t) {
   ]) {
     db.exec(`CREATE TABLE ${table} (id TEXT PRIMARY KEY)`);
   }
-  db.exec("PRAGMA user_version = 11");
+  db.exec("PRAGMA user_version = 13");
   db.close();
   chmodSync(database, 0o600);
 

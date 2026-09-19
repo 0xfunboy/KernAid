@@ -32,6 +32,14 @@ and select target disks. Fix the reported first-use stall before widening the
 repair catalog. Cloud availability is not assumed and cannot block offline
 diagnosis. A conversational assistant is not yet an autonomous repair engine.
 
+**19 September continuation:** the `53afa5a` image build is running. The next
+source batch adds a review-and-consent path for a minimal inspection summary
+to Pi; it is not part of that running image. The current-schema Enterprise
+offline backup/restore gate is now verified against a real signed v13 bundle
+without changing the live database. Readiness failures now have closed static
+diagnostic codes for the next image; the old Vault root cause remains unknown
+because its detailed artifact expired. These changes do not promote a release.
+
 **Release truth:** `6e9742e` passed its integrated image/boot/USB tests but the
 separate UEFI Vault lifecycle failed readiness; `internal.7` was not promoted.
 The repair candidate `01cf8fe` failed UEFI crypttab provider proof. These gates
@@ -1069,7 +1077,9 @@ remaining gates stated accurately. Not an authorization to sell repairs.
 - Close diagnosis → readable explanation → report export, including offline
   operation and cancellation. Keep provider credentials out of reports.
 - Connect diagnostic evidence to the bounded assistant with explicit context
-  selection/redaction; current chat does not automatically see disk contents.
+  selection/redaction: the reviewed, closed-summary path is now implemented
+  and locally checked, pending exact-image qualification. Chat never receives
+  raw disk contents automatically and cannot execute a repair.
 - Qualify the existing narrow repair candidates together, including target
   binding, separate backup, interrupted execution, verification and rollback.
 - Promote only actions supported by exact-image and physical evidence; keep
@@ -1081,8 +1091,10 @@ remaining gates stated accurately. Not an authorization to sell repairs.
 - Use existing Fleet and native Resident code, not a second control plane.
 - Demonstrate enrollment, trust anchors, restrictive policy and entitlement,
   one closed work order, signed result and audit on actual native endpoints.
-- Qualify restore of the current schema-v13 Fleet backup and signed update
-  rollback, then document installation/revocation/offline behavior.
+- Current schema-v13 signed backup verification and disposable restore passed
+  on 19 September ([evidence](../deploy/fleet/restore-drill-2026-09-19.md)). Next
+  qualify clean-host application/secret recovery and signed update rollback,
+  then document installation/revocation/offline behavior.
 - Sign/notarize installers using the owner's approved publisher identities;
   engineering packages remain visibly unsigned until this is done.
 - Keep local repair approval mandatory; Fleet cannot grant arbitrary shell or
