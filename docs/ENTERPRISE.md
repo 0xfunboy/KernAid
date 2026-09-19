@@ -30,24 +30,24 @@ schema.
 
 ## Implemented components
 
-| Path                                | Responsibility                                                                                     | Current boundary                                                                                 |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `crates/fleet-client`               | Canonical Ed25519 enrollment, inventory and signed work-order claim/result envelopes               | Offline/transport-neutral; reuses the existing protected device identity                         |
-| `crates/fleet-runtime`              | Durable SQLite outbox, inventory sequencing and verified entitlement state                         | External vendor anchor; paid features fail closed while diagnosis/export/rollback stay available |
-| `packages/fleet-schemas`            | Matching Node.js wire validation and canonical signing bytes                                       | Strict bounded v1 schemas                                                                        |
-| `services/fleet-control-plane`      | Tenant registry, signed device traffic, governance, work orders, incidents and commercial licensing | Live loopback origin at schema v13 behind the internal TLS tunnel                                |
+| Path                                | Responsibility                                                                                       | Current boundary                                                                                 |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `crates/fleet-client`               | Canonical Ed25519 enrollment, inventory and signed work-order claim/result envelopes                 | Offline/transport-neutral; reuses the existing protected device identity                         |
+| `crates/fleet-runtime`              | Durable SQLite outbox, inventory sequencing and verified entitlement state                           | External vendor anchor; paid features fail closed while diagnosis/export/rollback stay available |
+| `packages/fleet-schemas`            | Matching Node.js wire validation and canonical signing bytes                                         | Strict bounded v1 schemas                                                                        |
+| `services/fleet-control-plane`      | Tenant registry, signed device traffic, governance, work orders, incidents and commercial licensing  | Live loopback origin at schema v13 behind the internal TLS tunnel                                |
 | `apps/fleet-console`                | Same-origin inventory, governance, work-order, incident and license UI                               | Short-lived server-memory session, Secure cookie and CSRF; no persistent browser bearer token    |
-| `crates/fleet-policy`               | Offline policy issuer and signed, offline-capable restrictive bundle                               | Server receives no seed; policy can only narrow local permission                                 |
-| `crates/fleet-audit`                | Canonical signed audit events and tamper-evident chain checkpoints                                 | Digest-only device protocol with central signature, sequence and chain verification              |
-| `crates/entitlements`               | Signed offline entitlements and revocation checkpoints                                             | Paid capabilities degrade without disabling diagnostics, report export or rollback               |
-| `crates/update-client`              | Signed A/B release admission, offline issuer and boot-state planner                                | External trust anchor, monotonic manifests, ring/rollout/time gates and failed-boot rollback     |
-| `crates/fleet-resident-update`      | HTTPS update staging plus local UEFI/systemd-boot A/B activation                                   | Off-default; inactive-slot only, one-shot boot, fallback/offline rollback; never reboots          |
-| `tools/fleet-onboarding`            | Guided tenant creation and short-lived one-device provisioning bundle                              | Off-default CLI; owner-only files, no token output, shell, signing, or remote-command capability |
+| `crates/fleet-policy`               | Offline policy issuer and signed, offline-capable restrictive bundle                                 | Server receives no seed; policy can only narrow local permission                                 |
+| `crates/fleet-audit`                | Canonical signed audit events and tamper-evident chain checkpoints                                   | Digest-only device protocol with central signature, sequence and chain verification              |
+| `crates/entitlements`               | Signed offline entitlements and revocation checkpoints                                               | Paid capabilities degrade without disabling diagnostics, report export or rollback               |
+| `crates/update-client`              | Signed A/B release admission, offline issuer and boot-state planner                                  | External trust anchor, monotonic manifests, ring/rollout/time gates and failed-boot rollback     |
+| `crates/fleet-resident-update`      | HTTPS update staging plus local UEFI/systemd-boot A/B activation                                     | Off-default; inactive-slot only, one-shot boot, fallback/offline rollback; never reboots         |
+| `tools/fleet-onboarding`            | Guided tenant creation and short-lived one-device provisioning bundle                                | Off-default CLI; owner-only files, no token output, shell, signing, or remote-command capability |
 | `crates/fleet-resident-work-orders` | Durable allowlisted device-side work-order client and Rescue handoff for all four repair identifiers | Off-default; Fleet intent never replaces fresh local Core/broker approval                        |
-| `deploy/fleet-resident-linux`       | Disabled-by-default amd64 Debian package for sync, work orders, staging and A/B activation          | Does not enroll, enable services, alter boot state or reboot during installation                 |
-| `deploy/fleet-resident-windows`     | On-demand Windows `LocalService` deployment for `windows.p0.diagnose.v1@1`                          | R0/digest-only; CI ZIP is explicitly unsigned and needs Authenticode/native qualification        |
-| `deploy/fleet-resident-macos`       | Off-default LaunchAgent deployment for `macos.p0.diagnose.v1@1` on Intel and Apple silicon          | R0/digest-only; CI bundles are explicitly unsigned/unnotarized and need native qualification     |
-| `deploy/fleet`                      | Signed online SQLite backup, offline verification/restore and persistent schedule                   | WAL-safe standalone three-file bundle signed by the provisioned service-receipt key              |
+| `deploy/fleet-resident-linux`       | Disabled-by-default amd64 Debian package for sync, work orders, staging and A/B activation           | Does not enroll, enable services, alter boot state or reboot during installation                 |
+| `deploy/fleet-resident-windows`     | On-demand Windows `LocalService` deployment for `windows.p0.diagnose.v1@1`                           | R0/digest-only; CI ZIP is explicitly unsigned and needs Authenticode/native qualification        |
+| `deploy/fleet-resident-macos`       | Off-default LaunchAgent deployment for `macos.p0.diagnose.v1@1` on Intel and Apple silicon           | R0/digest-only; CI bundles are explicitly unsigned/unnotarized and need native qualification     |
+| `deploy/fleet`                      | Signed online SQLite backup, offline verification/restore and persistent schedule                    | WAL-safe standalone three-file bundle signed by the provisioned service-receipt key              |
 
 The control plane binds every enrolled `KA-…` device ID to the raw Ed25519
 public key encoded in its canonical SPKI. Enrollment tokens are random,
@@ -58,44 +58,44 @@ and contains no enrollment or administrator token in plaintext.
 
 ## Current API
 
-| Method and route                                      | Authentication                                      | Purpose                                                     |
-| ----------------------------------------------------- | --------------------------------------------------- | ----------------------------------------------------------- |
-| `GET /healthz`                                        | None; expose only through operational health policy | Process/database health                                     |
-| `POST /v1/tenants`                                    | Fleet root bearer token                             | Create a tenant and return its one-time-visible admin token |
-| `POST /v1/admin/enterprise-licenses/import`            | Fleet root bearer token                             | Verify and import one offline-signed tenant license       |
-| `GET /v1/admin/enterprise-licenses/:tenantId`          | Fleet root bearer token                             | Inspect commercial status, seats and digest-only audit    |
-| `POST /v1/admin/enterprise-licenses/revoke`            | Fleet root bearer token                             | Revoke the exact current commercial license               |
-| `POST /v1/tenants/:tenantId/enrollment-tokens`        | Tenant admin bearer token                           | Create one expiring device enrollment token                 |
-| `POST /v1/enrollments`                                | Signed request plus one-time token                  | Bind the device identity to the tenant                      |
-| `POST /v1/inventories`                                | Enrolled-device Ed25519 signature                   | Submit one privacy-minimized asset envelope                 |
-| `POST /v1/audit-events`                               | Enrolled-device Ed25519 signature                   | Append one canonical digest-only chained event              |
-| `POST /v1/policy-pulls`                               | Enrolled-device Ed25519 signature                   | Return only signed policy bundles applicable to that device |
-| `POST /v1/tenants/:tenantId/policy-trust-anchor`      | Tenant admin bearer token                           | Set the tenant policy public key exactly once               |
-| `POST /v1/tenants/:tenantId/policies`                 | Tenant admin bearer token                           | Verify and publish an already-signed canonical policy       |
-| `POST /v1/entitlement-pulls`                          | Enrolled-device Ed25519 signature                   | Return applicable vendor-signed entitlement state           |
-| `POST /v1/update-pulls`                               | Enrolled-device Ed25519 signature                   | Return only applicable vendor-signed update manifests       |
-| `POST /v1/work-order-claims`                          | Enrolled-device Ed25519 signature                   | Lease one eligible typed order                              |
-| `POST /v1/work-order-results`                         | Enrolled-device Ed25519 signature                   | Commit one digest-only terminal result                      |
-| `POST /v1/tenants/:tenantId/entitlements`             | Tenant admin bearer token                           | Verify and publish an offline vendor-signed entitlement     |
-| `POST /v1/tenants/:tenantId/entitlement-revocations`  | Tenant admin bearer token                           | Verify and publish the monotonic signed revocation list     |
-| `POST /v1/tenants/:tenantId/update-manifests`         | Tenant admin bearer token                           | Verify and publish an offline vendor-signed update           |
-| `GET /v1/tenants/:tenantId/enterprise-license`        | Tenant operator or admin                            | Minimized license status and seat usage                      |
-| `GET /v1/tenants/:tenantId/devices`                   | Tenant admin bearer token                           | List tenant devices                                         |
-| `GET /v1/tenants/:tenantId/assets`                    | Tenant admin bearer token                           | List current tenant assets                                  |
-| `GET /v1/tenants/:tenantId/audit-events`              | Tenant admin bearer token                           | List bounded minimized audit events                         |
-| `GET /v1/tenants/:tenantId/work-orders`               | Tenant operator or admin                            | List bounded tenant work-order state                        |
-| `POST /v1/tenants/:tenantId/work-orders`              | Tenant operator or admin                            | Queue one closed-catalog typed action                       |
-| `POST /v1/tenants/:tenantId/work-orders/:id/approve`  | Tenant admin                                        | Approve one organizational write intent                     |
-| `POST /v1/tenants/:tenantId/work-orders/:id/cancel`   | Tenant operator or admin                            | Cancel an unleased order                                    |
-| `GET /v1/tenants/:tenantId/work-order-events`         | Tenant operator or admin                            | List digest-only state transitions                          |
-| `GET /v1/tenants/:tenantId/incident-cases`            | Tenant operator or admin                            | List tenant-isolated operational cases                      |
-| `POST /v1/tenants/:tenantId/incident-cases`           | Tenant operator or admin                            | Open a case from one enrolled device or asset               |
-| `POST /v1/tenants/:tenantId/incident-cases/:id/update` | Tenant operator or admin                            | Change bounded status, severity or assignee                  |
-| `POST /v1/tenants/:tenantId/incident-cases/:id/work-orders` | Tenant operator or admin                       | Link a typed work order and its digest-only state            |
-| `POST /v1/tenants/:tenantId/incident-cases/:id/close` | Tenant admin                                        | Seal a canonical closure report and signed service receipt  |
-| `GET /v1/tenants/:tenantId/incident-case-events`      | Tenant operator or admin                            | List the minimized incident timeline                        |
-| `POST /v1/tenants/:tenantId/devices/:deviceId/revoke` | Tenant admin bearer token                           | Revoke future device submissions                            |
-| `GET /console/`                                       | Same origin                                         | Serve the static operator console when configured           |
+| Method and route                                            | Authentication                                      | Purpose                                                     |
+| ----------------------------------------------------------- | --------------------------------------------------- | ----------------------------------------------------------- |
+| `GET /healthz`                                              | None; expose only through operational health policy | Process/database health                                     |
+| `POST /v1/tenants`                                          | Fleet root bearer token                             | Create a tenant and return its one-time-visible admin token |
+| `POST /v1/admin/enterprise-licenses/import`                 | Fleet root bearer token                             | Verify and import one offline-signed tenant license         |
+| `GET /v1/admin/enterprise-licenses/:tenantId`               | Fleet root bearer token                             | Inspect commercial status, seats and digest-only audit      |
+| `POST /v1/admin/enterprise-licenses/revoke`                 | Fleet root bearer token                             | Revoke the exact current commercial license                 |
+| `POST /v1/tenants/:tenantId/enrollment-tokens`              | Tenant admin bearer token                           | Create one expiring device enrollment token                 |
+| `POST /v1/enrollments`                                      | Signed request plus one-time token                  | Bind the device identity to the tenant                      |
+| `POST /v1/inventories`                                      | Enrolled-device Ed25519 signature                   | Submit one privacy-minimized asset envelope                 |
+| `POST /v1/audit-events`                                     | Enrolled-device Ed25519 signature                   | Append one canonical digest-only chained event              |
+| `POST /v1/policy-pulls`                                     | Enrolled-device Ed25519 signature                   | Return only signed policy bundles applicable to that device |
+| `POST /v1/tenants/:tenantId/policy-trust-anchor`            | Tenant admin bearer token                           | Set the tenant policy public key exactly once               |
+| `POST /v1/tenants/:tenantId/policies`                       | Tenant admin bearer token                           | Verify and publish an already-signed canonical policy       |
+| `POST /v1/entitlement-pulls`                                | Enrolled-device Ed25519 signature                   | Return applicable vendor-signed entitlement state           |
+| `POST /v1/update-pulls`                                     | Enrolled-device Ed25519 signature                   | Return only applicable vendor-signed update manifests       |
+| `POST /v1/work-order-claims`                                | Enrolled-device Ed25519 signature                   | Lease one eligible typed order                              |
+| `POST /v1/work-order-results`                               | Enrolled-device Ed25519 signature                   | Commit one digest-only terminal result                      |
+| `POST /v1/tenants/:tenantId/entitlements`                   | Tenant admin bearer token                           | Verify and publish an offline vendor-signed entitlement     |
+| `POST /v1/tenants/:tenantId/entitlement-revocations`        | Tenant admin bearer token                           | Verify and publish the monotonic signed revocation list     |
+| `POST /v1/tenants/:tenantId/update-manifests`               | Tenant admin bearer token                           | Verify and publish an offline vendor-signed update          |
+| `GET /v1/tenants/:tenantId/enterprise-license`              | Tenant operator or admin                            | Minimized license status and seat usage                     |
+| `GET /v1/tenants/:tenantId/devices`                         | Tenant admin bearer token                           | List tenant devices                                         |
+| `GET /v1/tenants/:tenantId/assets`                          | Tenant admin bearer token                           | List current tenant assets                                  |
+| `GET /v1/tenants/:tenantId/audit-events`                    | Tenant admin bearer token                           | List bounded minimized audit events                         |
+| `GET /v1/tenants/:tenantId/work-orders`                     | Tenant operator or admin                            | List bounded tenant work-order state                        |
+| `POST /v1/tenants/:tenantId/work-orders`                    | Tenant operator or admin                            | Queue one closed-catalog typed action                       |
+| `POST /v1/tenants/:tenantId/work-orders/:id/approve`        | Tenant admin                                        | Approve one organizational write intent                     |
+| `POST /v1/tenants/:tenantId/work-orders/:id/cancel`         | Tenant operator or admin                            | Cancel an unleased order                                    |
+| `GET /v1/tenants/:tenantId/work-order-events`               | Tenant operator or admin                            | List digest-only state transitions                          |
+| `GET /v1/tenants/:tenantId/incident-cases`                  | Tenant operator or admin                            | List tenant-isolated operational cases                      |
+| `POST /v1/tenants/:tenantId/incident-cases`                 | Tenant operator or admin                            | Open a case from one enrolled device or asset               |
+| `POST /v1/tenants/:tenantId/incident-cases/:id/update`      | Tenant operator or admin                            | Change bounded status, severity or assignee                 |
+| `POST /v1/tenants/:tenantId/incident-cases/:id/work-orders` | Tenant operator or admin                            | Link a typed work order and its digest-only state           |
+| `POST /v1/tenants/:tenantId/incident-cases/:id/close`       | Tenant admin                                        | Seal a canonical closure report and signed service receipt  |
+| `GET /v1/tenants/:tenantId/incident-case-events`            | Tenant operator or admin                            | List the minimized incident timeline                        |
+| `POST /v1/tenants/:tenantId/devices/:deviceId/revoke`       | Tenant admin bearer token                           | Revoke future device submissions                            |
+| `GET /console/`                                             | Same origin                                         | Serve the static operator console when configured           |
 
 The service accepts no arbitrary command, script, filesystem path or broker
 request. Adding one would violate the Enterprise trust boundary.
@@ -203,9 +203,10 @@ is now v13, so that older evidence is not presented as a v13 restore result.
 Root and tenant credentials remain owner-only and outside source control.
 
 The automated native package lifecycle is green for the exact current-source
-engineering artifacts: Linux run `33459558805`, Windows run `33459558875` and
-macOS run `33459559165`. These gates staged the packages, proved disabled
-startup, exercised the deliberate missing-trust-anchor failure and cleaned up;
+engineering artifacts from `fe3c940`: Linux run `33471097700`, Windows run
+`33471100838` and macOS run `33471099291`. These gates staged the packages,
+inspected the enrollment/claim/result contract, proved disabled startup,
+exercised the deliberate missing-trust-anchor failure and cleaned up;
 Windows additionally proved an on-demand stopped `LocalService`, and both
 native macOS architectures proved that no LaunchAgent was loaded. They do not
 qualify real identity/enrollment, OS secret stores, publisher signing or
@@ -219,8 +220,10 @@ The remaining RC work is:
    in the authenticated project area;
 2. qualify the Linux UEFI/systemd-boot A/B activator on a disposable two-slot
    system and bind it to one exact signed release; BIOS/GRUB remains unsupported;
-3. let repair run `33459558782` finish, then qualify all four local Rescue
-   Fleet adapters end to end. Fleet may deliver intent, but Desk must still
+3. resolve the latest repair run `33482972849` failure at UEFI crypttab
+   `stage=provider-proof code=command-failed`, then qualify all four local
+   Rescue Fleet adapters end to end. No repair run is presumed still active
+   from the earlier checkpoint. Fleet may deliver intent, but Desk must still
    collect a fresh target/evidence-bound approval before Core/Broker/Vault can
    mutate anything;
 4. complete publisher signing, notarization/Authenticode, production

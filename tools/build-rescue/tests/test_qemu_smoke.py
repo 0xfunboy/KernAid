@@ -577,6 +577,7 @@ signal.signal(signal.SIGTERM, observe_term)
 if os.environ.get("KERNAID_MOCK_QEMU_NOT_READY") == "1":
     print("KERNAID_RESCUE_NOT_READY: private-reason=must-not-escape", flush=True)
 print("KERNAID_RESCUE_READY", flush=True)
+print("KERNAID_RESCUE_ASSISTANT_READY_V1 relay=unix network=enumerated search=local ready=true", flush=True)
 hardware_marker = "KERNAID_RESCUE_HARDWARE_INVENTORY_READY"
 sys.stdout.write(hardware_marker + "\r\n")
 if os.environ.get("KERNAID_MOCK_DUPLICATE_HARDWARE_MARKER") == "1":
@@ -603,6 +604,7 @@ time.sleep(30)
 '
             fi
             printf 'KERNAID_RESCUE_READY\n'
+            printf 'KERNAID_RESCUE_ASSISTANT_READY_V1 relay=unix network=enumerated search=local ready=true\n'
             printf 'KERNAID_RESCUE_HARDWARE_INVENTORY_READY\r\n'
             if [[ "${KERNAID_MOCK_DUPLICATE_HARDWARE_MARKER:-0}" == "1" ]]; then
               printf 'KERNAID_RESCUE_HARDWARE_INVENTORY_READY\r\n'
@@ -640,6 +642,26 @@ time.sleep(30)
 
 
 class QemuSmokeFixturePrivilegeTests(unittest.TestCase):
+    def test_assistant_gate_requires_the_complete_local_readiness_marker(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        definition = QemuProcessLifecycleTests.function_definition(source, "assistant_ready_observed")
+        marker = "KERNAID_RESCUE_ASSISTANT_READY_V1 relay=unix network=enumerated search=local ready=true"
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "serial.log"
+            for payload, expected in [
+                (marker + "\r\n", 0),
+                ("KERNAID_RESCUE_READY\n", 1),
+                ("prefix" + marker + "\n", 1),
+                (marker + "-suffix\n", 1),
+            ]:
+                with self.subTest(payload=payload):
+                    log.write_text(payload, encoding="utf-8")
+                    result = subprocess.run(
+                        ["bash", "-c", 'set -euo pipefail\nlog="$1"\n' + definition + "\nassistant_ready_observed", "bash", str(log)],
+                        capture_output=True, text=True, timeout=5, check=False,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stderr)
+
     def test_hardware_inventory_marker_is_framed_strict_and_unique(self) -> None:
         ready = READY_CHECK.read_text(encoding="utf-8")
         script = SCRIPT.read_text(encoding="utf-8")

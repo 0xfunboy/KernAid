@@ -1,9 +1,10 @@
 # KernAid seven-day RC execution plan
 
-This plan is prepared for the next execution window and is currently paused
-after the diagnosis-release/site/documentation closeout requested by the
-owner. Resume it with the
-[AI product-completion directive](AI_PRODUCT_COMPLETION_DIRECTIVE.md).
+Execution resumed on 19 September 2026 with the network-first Consumer batch.
+Use the [AI product-completion directive](AI_PRODUCT_COMPLETION_DIRECTIVE.md)
+and the active priority order in MASTERPLAN section 15. The day labels below
+are the accelerated RC target, not elapsed calendar time or a commercial
+launch guarantee; external signing and physical qualification remain gates.
 Product scope and safety boundaries remain defined by
 [MASTERPLAN.md](MASTERPLAN.md); exact shipped behavior remains defined by
 [CURRENT_STATUS.md](CURRENT_STATUS.md).
@@ -38,16 +39,26 @@ never claim otherwise.
 Workstreams run in parallel; the day column is a deadline, not a serialized
 queue.
 
-| Deadline | Integrated outcome |
-| --- | --- |
-| Today | Qualify and promote the current diagnosis ISO, update the trusted catalog and authenticated site, and publish one unambiguous Windows download path. |
-| Day 2 | Close the consumer Rescue/Desk journey: guided diagnosis, offline fallback, Vault, report export, Media Creator and recovery instructions. |
-| Day 4 | Promote the four bounded Linux Rescue repairs after their combined apply/failure/rollback matrix; finish the corresponding approval and recovery UX. |
-| Day 5 | Close the Enterprise software loop across onboarding, Resident identity, restrictive policy, licensing, work orders, local approval, signed result, incidents, updates and audit. |
-| Day 6 | Complete the installable Linux/Windows/macOS Resident packages, Windows-native repair expansion and the customer-buildable WinPE companion path that Microsoft licensing permits. |
-| Day 7 | Run one final integrated matrix, publish the consumer and Enterprise RC artifacts, update the commercial/private site and freeze exact operator documentation. |
+| Deadline      | Integrated outcome                                                                                                                                                                       |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Current batch | Build the network-first Pi/SearXNG diagnosis ISO, qualify its boot/services and expose a reviewed physical-test candidate. Keep stable/catalog promotion gated on full release evidence. |
+| Day 2         | Close the consumer Rescue/Desk journey: guided diagnosis, offline fallback, Vault, report export, Media Creator and recovery instructions.                                               |
+| Day 4         | Promote the four bounded Linux Rescue repairs after their combined apply/failure/rollback matrix; finish the corresponding approval and recovery UX.                                     |
+| Day 5         | Close the Enterprise software loop across onboarding, Resident identity, restrictive policy, licensing, work orders, local approval, signed result, incidents, updates and audit.        |
+| Day 6         | Complete the installable Linux/Windows/macOS Resident packages, Windows-native repair expansion and the customer-buildable WinPE companion path that Microsoft licensing permits.        |
+| Day 7         | Run one final integrated matrix, publish the consumer and Enterprise RC artifacts, update the commercial/private site and freeze exact operator documentation.                           |
 
-## Checkpoint — 1 September 2026
+## Source checkpoint — 19 September 2026
+
+Network/provider setup now precedes target inventory; explicit offline
+continuation remains available. Gemrouter `gemini-3.8-flash` is the default,
+with selectable compatible endpoints, Pi's bounded web-search-only runtime
+and local SearXNG. Credential endpoint binding, headless NetworkManager
+permissions and production bundle import checks are in the active batch.
+These source changes have no promoted ISO yet. See
+[implementation notes](RESCUE_NETWORK_FIRST.md).
+
+## Artifact checkpoint — 1 September 2026 (unchanged)
 
 The closed diagnosis cohort is exact source commit
 `6e9742e5b0c4397728dde80e9a0a91a09214f7cd`. CI run `33486399168` and Desktop
@@ -64,8 +75,8 @@ The exact current repair candidate is commit
 `01cf8fe981971ea9c1b3fa82d1f90de744a0d3ad`, Repair run `33482972849`. The
 consolidated batch failed at `uefi:crypttab-lifecycle` with the exact marker
 `stage=provider-proof code=command-failed`; no qualified ISO or publisher was
-produced. Per the owner stop request, this candidate is recorded but not fixed
-or rerun in the current closeout.
+produced. It was not fixed during the earlier owner-requested closeout; it is
+now a recorded P1 gate after the network-first candidate, not a running job.
 
 Integrated in current source, but still off-default or awaiting exact-image
 qualification:
@@ -100,8 +111,8 @@ publisher-signing and endpoint-to-production-Fleet evidence remain external.
 The stable download remains `0.1.0-internal.6` because the diagnosis cohort did
 not satisfy every Vault gate. Run `33486399275` is exposed separately and
 truthfully as physical-test input; it is not trusted-catalog or Release Channel
-promotion. Further feature work and reruns are paused after the current
-site/documentation closeout, per the owner stop request.
+promotion. Work has resumed with the network-first source batch; none of
+these older artifact qualifications is automatically transferred to a new ISO.
 
 ## RC completion gate
 

@@ -1,6 +1,6 @@
 # KernAid current status
 
-Last updated: 18 September 2026
+Last updated: 19 September 2026
 
 New source checkpoint: Rescue starts with network setup and a Pi assistant
 using Gemrouter `gemini-3.8-flash`, selectable compatible providers and local
@@ -8,6 +8,18 @@ SearXNG search. This change is not in a newly qualified ISO. Existing release
 evidence below is the 1 September checkpoint. See
 [network-first implementation and verification](RESCUE_NETWORK_FIRST.md) for
 the new behavior, router limitation and remaining physical test gates.
+
+Production work resumed on 19 September. The active batch hardens Wi-Fi
+activation by the assistant service, endpoint-bound credential isolation,
+wizard configuration restoration and production Pi/SearXNG packaging. The
+local runtime checks and Desk build passed; a new exact-image qualification
+is still required before changing the stable download.
+
+The canonical checkout is now the only active worktree. Seventeen clean,
+patch-integrated scratch worktrees and their reproducible caches were removed;
+unique historical probes/logs were archived, not discarded. The site's live
+artifact store and services were preserved. See [workspace layout](WORKSPACE_LAYOUT.md)
+and the [updated production backlog](MASTERPLAN.md#15-active-production-backlog).
 
 This page separates the product vision from what the repository can safely do
 today. The short version is: **the stable customer image is still a
@@ -26,8 +38,8 @@ Observe → Diagnose → Plan → Approve → Repair → Verify → Roll back if
 
 The model never receives a privileged raw shell. Collectors produce bounded,
 typed evidence; Core validates plans and policy; only a narrow broker may ever
-perform an approved mutation. Phase 0 deliberately stops before production
-mutation.
+perform an approved mutation. The stable preview deliberately stops before
+production mutation; the project is no longer at the scaffold stage.
 
 The product family has four active engineering surfaces:
 
@@ -57,7 +69,7 @@ production promotion of repair packs remain open milestones.
 | Reporting                                        | Resident Desk exposes authoritative machine-readable JSON: a signed envelope when secure audit is active, otherwise an explicitly unsigned hashed JSON artifact. It also derives an always-unsigned human-readable Markdown copy that does not replace the JSON. Rescue can persist the exact signed JSON report plus audit sequence in the Vault and export it through the native TTY companion                                                                                                                                                                                                                                                                                                                                                 |
 | Rescue credential boundary                       | Isolated credential vault and fail-closed Codex login/status/logout bridge; it does not run prompts or diagnoses                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Rescue provider plumbing                         | Feature-gated OpenAI executor and loopback relay are implemented, but live TLS and a real-account lifecycle are not yet qualified                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| Exact-image harness                              | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/Vault coverage. Diagnosis run `33486399275` on `6e9742e` passed its integrated build/boot/USB matrix but failed UEFI Vault readiness. Repair run `33482972849` on `01cf8fe` failed at `uefi:crypttab-lifecycle` (`provider-proof/command-failed`); neither ISO was promoted.                                                                                                                                                                                                                                                                                                                       |
+| Exact-image harness                              | Disposable QEMU fixtures, byte-level mutation checks, BIOS/UEFI boot and two-boot USB/Vault coverage. Diagnosis run `33486399275` on `6e9742e` passed its integrated build/boot/USB matrix but failed UEFI Vault readiness. Repair run `33482972849` on `01cf8fe` failed at `uefi:crypttab-lifecycle` (`provider-proof/command-failed`); neither ISO was promoted.                                                                                                                                                                                                                                                                                                                                                                               |
 | Repair experiment                                | Linux-only feature-gated Desk lab for one typed R2 repair and separately approved rollback on an internal temporary fixture. It now traverses the standard `SessionDriver`, Agent Gateway, explicit Core transaction states and typed broker; it remains absent from normal/Rescue builds and disconnected from production targets                                                                                                                                                                                                                                                                                                                                                                                                               |
 | Feature-gated Rescue repair candidate            | Off-default `fstab`, `crypttab`, ext4 and resolver-link recovery actions traverse the closed UI/Core/broker boundary. They bind a descriptor-retained target, reserve evidence on a distinct authenticated Vault, require typed single-use approval, verify the result and expose rollback or truthful manual reconciliation. The stable image excludes every repair surface.                                                                                                                                                                                                                                                                                                                                                                    |
 | `fstab` recovery                                 | `linux.fstab.disable-missing-uuid.v1` atomically disables only a freshly proven missing, non-critical ext4 UUID entry and supports exact restore, automatic restore and restart reconciliation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -76,8 +88,8 @@ production promotion of repair packs remain open milestones.
 | Signed A/B activation                            | The off-default Linux activator admits only a signed, already staged inactive slot on locally provisioned UEFI/systemd-boot A/B systems. It persists before `bootctl`, uses one-shot boot, promotes or records fallback, retains offline rollback and never repartitions or reboots. BIOS/GRUB fails closed.                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | Windows Media Creator                            | The native wizard consumes one exact Ed25519-signed release bundle, lists only qualified removable whole disks, requires exact erase confirmation, streams the XZ image and performs full readback SHA-256. Its workflow output remains an explicitly unsigned EXE/ZIP until Authenticode is applied externally.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Private software catalog                         | The authenticated project site serves the reviewed Media Creator and current Linux, Windows and dual-architecture macOS Resident engineering artifacts. Resident provenance is pinned to `fe3c940` and runs `33471097700`, `33471100838` and `33471099291`, with exact bytes, checksum, qualification and unsigned status. Each route remains independently fail-closed if its reviewed file or metadata is absent. ISO metadata is changed only after explicit terminal review and promotion.                                                                                                                                                                                                                                                   |
-| Rescue first boot                                | The zero-p3 implementation provisions the canonical LUKS2/ext4 Vault, seeds its identity and provider home, closes it and verifies the locked profile. Run `33486399275` passed the integrated image/USB matrix but its separate UEFI lifecycle did not reach readiness, so this exact image has no persistence qualification.                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Release channel                                  | Canonical Release Channel v1, anti-rollback links and strict verification are implemented. `internal.7` was correctly not dispatched because run `33486399275` failed a required lifecycle gate. Stable `internal.6` remains unchanged; the newer ISO is offered only as a clearly marked private physical-test candidate.                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Rescue first boot                                | The zero-p3 implementation provisions the canonical LUKS2/ext4 Vault, seeds its identity and provider home, closes it and verifies the locked profile. Run `33486399275` passed the integrated image/USB matrix but its separate UEFI lifecycle did not reach readiness, so this exact image has no persistence qualification.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Release channel                                  | Canonical Release Channel v1, anti-rollback links and strict verification are implemented. `internal.7` was correctly not dispatched because run `33486399275` failed a required lifecycle gate. Stable `internal.6` remains unchanged; the newer ISO is offered only as a clearly marked private physical-test candidate.                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 The canonical repository is
 [`0xfunboy/KernAid`](https://github.com/0xfunboy/KernAid), branch `main`.
@@ -158,8 +170,8 @@ The current integrated diagnosis source cut is commit
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Source CI     | [Run 33486399168](https://github.com/0xfunboy/KernAid/actions/runs/33486399168), **success**                                                                                                           |
 | Desktop       | [Run 33486399165](https://github.com/0xfunboy/KernAid/actions/runs/33486399165), **success**: Windows x86-64, Linux x86-64, macOS x86-64 and macOS aarch64 packaging plus provider-companion exclusion |
-| Diagnosis ISO | [Rescue run 33486399275](https://github.com/0xfunboy/KernAid/actions/runs/33486399275), integrated build/boot/USB matrix **success**; UEFI Vault lifecycle **failure** at readiness; no promotion       |
-| Repair ISO    | [Repair run 33482972849](https://github.com/0xfunboy/KernAid/actions/runs/33482972849), **failure** at `uefi:crypttab-lifecycle`; qualified release skipped                                           |
+| Diagnosis ISO | [Rescue run 33486399275](https://github.com/0xfunboy/KernAid/actions/runs/33486399275), integrated build/boot/USB matrix **success**; UEFI Vault lifecycle **failure** at readiness; no promotion      |
+| Repair ISO    | [Repair run 33482972849](https://github.com/0xfunboy/KernAid/actions/runs/33482972849), **failure** at `uefi:crypttab-lifecycle`; qualified release skipped                                            |
 
 The exact diagnostic physical-test candidate is `KernAid-Rescue-amd64.iso`,
 artifact version `ci-33486399275-1`, `1,307,344,896` bytes, SHA-256
@@ -212,12 +224,13 @@ hardware-backed secret storage or a physical production endpoint.
 
 ## Immediate next gates
 
-1. Use Rescue run `33486399275` only as the authenticated physical-test
-   candidate. Do not promote it: UEFI Vault lifecycle readiness failed and
-   `internal.7` was not dispatched.
+1. Build and check the network-first Pi/SearXNG candidate, then review its
+   exact artifact for physical testing. Until superseded, Rescue run
+   `33486399275` remains only the authenticated physical-test candidate. Do
+   not promote it: UEFI Vault readiness failed and `internal.7` was not dispatched.
 2. Repair run `33482972849` failed at the UEFI crypttab provider-proof step.
-   Keep the candidate unavailable; its correction and rerun are paused by the
-   owner rather than folded into this diagnosis-release closeout.
+   Keep that candidate unavailable; resolve and rerun it as P1 after the
+   current network-first batch, rather than expanding the active ISO scope.
 3. The staged native Resident lifecycle and explicit enrollment contract are
    green in runs `33471097700`, `33471100838` and `33471099291`. Next qualify
    native key stores and the closed enrollment/R0 work-order lifecycle on

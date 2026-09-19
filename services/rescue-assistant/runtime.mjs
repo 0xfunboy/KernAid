@@ -173,6 +173,8 @@ export async function connectNetwork({ adapter, ssid, password = "" }) {
       throw new Error("Invalid Wi-Fi details.");
     // Password travels over stdin, never argv or a log. NetworkManager owns
     // its profile in the live system; no installed-system path is touched.
+    // This service has no login session. Private profiles require an active
+    // owner session, so they cannot be used by the headless wizard account.
     await nmcli(
       [
         "--ask",
@@ -183,7 +185,7 @@ export async function connectNetwork({ adapter, ssid, password = "" }) {
         "ifname",
         adapter,
         "private",
-        "yes",
+        "no",
       ],
       password + "\n",
     );
@@ -243,21 +245,27 @@ export class AssistantRuntime {
         const stat = await fs.lstat(this.keyFile);
         if (!stat.isFile() || stat.mode & 0o077)
           throw new Error("Private key file permissions required.");
-        this.keys.set(
-          "gemrouter",
-          (await fs.readFile(this.keyFile, "utf8")).trim(),
-        );
+        this.keys.set("gemrouter", {
+          baseUrl: defaults.surfaces.gemrouter.baseUrl,
+          value: (await fs.readFile(this.keyFile, "utf8")).trim(),
+        });
       } catch (error) {
         if (error.code !== "ENOENT")
           throw new Error("Cannot load private assistant credential.");
       }
     }
   }
+  credential() {
+    const credential = this.keys.get(this.config.surface);
+    return credential?.baseUrl === this.config.baseUrl
+      ? credential.value
+      : undefined;
+  }
   status() {
     return {
       defaults,
       config: this.config,
-      credentialPresent: Boolean(this.keys.get(this.config.surface)),
+      credentialPresent: Boolean(this.credential()),
       verified: this.verified,
       searchEnabled: Boolean(this.searchUrl),
       harness: "Pi",
@@ -285,14 +293,10 @@ export class AssistantRuntime {
     )
       throw new Error("Invalid API key.");
     // Never reuse a credential when the endpoint changes, including custom URLs.
-    if (
-      baseUrl !==
-      (this.config.surface === input.surface
-        ? this.config.baseUrl
-        : defaults.surfaces[input.surface].baseUrl)
-    )
+    if (this.keys.get(input.surface)?.baseUrl !== baseUrl)
       this.keys.delete(input.surface);
-    if (input.apiKey) this.keys.set(input.surface, input.apiKey);
+    if (input.apiKey)
+      this.keys.set(input.surface, { baseUrl, value: input.apiKey });
     this.config = {
       surface: input.surface,
       label: defaults.surfaces[input.surface].label,
@@ -307,7 +311,7 @@ export class AssistantRuntime {
     return this.status();
   }
   async models() {
-    const key = this.keys.get(this.config.surface);
+    const key = this.credential();
     if (!key) throw new Error("Enter an API key for this provider.");
     const data = await boundedJson(this.config.baseUrl + "/models", {
       headers: { Authorization: `Bearer ${key}` },
@@ -341,7 +345,7 @@ export class AssistantRuntime {
   }
   async createSession() {
     const config = this.config;
-    const key = this.keys.get(config.surface);
+    const key = this.credential();
     if (!key || !config.model)
       throw new Error("Choose a model and enter its API key.");
     const modelRuntime = await ModelRuntime.create({

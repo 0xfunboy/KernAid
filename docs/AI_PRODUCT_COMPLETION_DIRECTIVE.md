@@ -1,22 +1,25 @@
 # KernAid AI product-completion directive
 
-> Prepared continuation directive. Execution is paused after the current
-> diagnosis-release/site/documentation closeout, as explicitly requested by
-> the owner; paste this directive to resume the remaining product work.
+> Esecuzione ripresa su richiesta del proprietario il 19 settembre 2026.
+> Priorità attuale: nuovo avvio Consumer rete/Pi prima dei dischi, quindi ISO
+> candidata verificabile. Stato esatto in `CURRENT_STATUS.md`, ordine operativo
+> in `MASTERPLAN.md` sezione 15. Non ripartire dal Phase 0.
 
 Portare KernAid dall'attuale release candidate a un prodotto software completo
 nelle due edizioni Consumer ed Enterprise entro un massimo di sette giorni
-attivi di elaborazione AI.
+attivi di elaborazione AI come obiettivo interno della RC. Non trasformare
+questo obiettivo in una promessa di lancio: firma, prove fisiche e decisioni
+commerciali esterne vanno dichiarate separatamente.
 
 Procedere autonomamente, code-first e con più agenti in parallelo su stream
 indipendenti. Dare priorità nell'ordine a:
 
-1. qualificare, promuovere e pubblicare immediatamente sul sito l'ultima ISO
-   diagnosis-only, con checksum, catalogo trusted e percorso Windows di
-   scrittura USB coerenti;
+1. integrare rete Ethernet/Wi-Fi, Pi, Gemrouter `gemini-3.8-flash`, SearXNG e
+   fallback offline nella nuova ISO diagnosis-only; pubblicare un candidato
+   fisico distinto dallo stable, e promuovere solo dopo i gate della release;
 2. completare il flusso Consumer guidato Rescue/Desk: avvio, diagnosi offline,
-   Vault, provider opzionale, spiegazione semplice, report, Media Creator e
-   recovery;
+   Vault quando necessario, provider opzionale, spiegazione semplice, report,
+   Media Creator e recovery, senza bloccare la prima schermata sul disco;
 3. qualificare e promuovere i repair pack chiusi con target binding, backup,
    approvazione locale, verifica e rollback;
 4. chiudere il ciclo Enterprise: onboarding, Resident multipiattaforma,

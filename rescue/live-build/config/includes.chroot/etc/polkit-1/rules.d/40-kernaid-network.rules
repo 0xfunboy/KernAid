@@ -1,10 +1,12 @@
 // Only the fixed local wizard service can configure live networking.
 // The Pi tool allowlist contains web_search only; it cannot invoke nmcli.
+// Live-system profiles must be usable without a login session belonging to
+// this daemon account (NetworkManager private profiles require one).
 polkit.addRule(function(action, subject) {
     if (subject.user === "kernaid-assistant" && [
         "org.freedesktop.NetworkManager.network-control",
         "org.freedesktop.NetworkManager.wifi.scan",
         "org.freedesktop.NetworkManager.enable-disable-wifi",
-        "org.freedesktop.NetworkManager.settings.modify.own"
+        "org.freedesktop.NetworkManager.settings.modify.system"
     ].indexOf(action.id) !== -1) return polkit.Result.YES;
 });

@@ -60,6 +60,10 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 24.18.0, cache: pnpm }
       - run: pnpm install --frozen-lockfile
+      - name: Check network-first assistant contract
+        run: |
+          pnpm --filter @kernaid/rescue-assistant check
+          pnpm --filter @kernaid/rescue-assistant test
       - run: KERNAID_REPAIR_CANDIDATE=0 pnpm --filter @kernaid/desk build
       - name: Install VM tooling
         run: |

@@ -538,6 +538,16 @@ while [ "$attempt" -le 30 ]; do
 done
 test -n "$index" || fail "local UI server did not answer"
 
+if [ "$offline_inspection_smoke" = "1" ]; then
+    /usr/bin/timeout --signal=TERM --kill-after=1s 72s \
+        /usr/bin/python3 -I -B /usr/lib/kernaid/assistant_ready_check.py >/dev/ttyS0 \
+        || fail "local connection assistant or search service did not answer"
+    for assistant_unit in kernaid-assistant.service kernaid-search.service; do
+        systemctl is-active --quiet "$assistant_unit" \
+            || fail "local connection assistant or search service is not active"
+    done
+fi
+
 application_status="$(curl --fail --silent --show-error --max-time 25 "$base_url/api/rescue/vault/status")" \
     || fail "Application relay status endpoint failed"
 printf '%s' "$application_status" | python3 -c 'import json,sys; data=json.load(sys.stdin); set(data) == {"apiVersion","stateVersion","vaultState"} or sys.exit("Application status shape failed"); data.get("apiVersion") == "kernaid.dev/rescue-application-http/v1alpha1" or sys.exit("Application status version failed"); isinstance(data.get("stateVersion"), int) and not isinstance(data.get("stateVersion"), bool) and 0 <= data["stateVersion"] <= 9007199254740991 or sys.exit("Application state version failed"); data.get("vaultState") in {"absent","unprovisioned","locked","unlocking","unlocked","locking","faulted-reboot-required"} or sys.exit("Application vault state failed")' \

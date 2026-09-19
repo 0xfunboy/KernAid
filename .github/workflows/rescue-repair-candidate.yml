@@ -20,6 +20,8 @@ jobs:
         run: |
           test "$(node --version)" = "v24.18.0"
           pnpm install --frozen-lockfile
+          pnpm --filter @kernaid/rescue-assistant check
+          pnpm --filter @kernaid/rescue-assistant test
           KERNAID_REPAIR_CANDIDATE=1 pnpm --filter @kernaid/desk build
 
       - name: Install build and VM tooling

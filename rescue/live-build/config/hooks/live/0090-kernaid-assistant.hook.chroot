@@ -22,4 +22,10 @@ python3 -m venv /opt/kernaid/searxng
 /opt/kernaid/searxng/bin/pip install --disable-pip-version-check --no-cache-dir \
     --no-build-isolation /opt/kernaid/searxng-source
 test "$(/opt/kernaid/assistant/node --version)" = v24.18.0
+# Repeat the import in the target distribution: host success does not prove
+# that the shipped runtime and production dependencies work in Debian.
+/opt/kernaid/assistant/node --input-type=module -e \
+    'await import("file:///opt/kernaid/assistant/runtime.mjs")'
+SEARXNG_SETTINGS_PATH=/etc/kernaid-assistant/searxng.yml \
+    /opt/kernaid/searxng/bin/python -c 'import searx.webapp'
 systemctl enable kernaid-assistant.service kernaid-search.service

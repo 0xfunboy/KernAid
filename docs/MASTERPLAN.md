@@ -1,13 +1,53 @@
 # KernAid — Product, Architecture and Repository Masterplan
 
-> This is the long-range product plan originally written on 1 August 2026.
-> For implemented behavior, qualification and active release gates, the
-> authoritative source is [Current status](CURRENT_STATUS.md).
+> Active production plan, updated 19 September 2026. The original architecture
+> is retained below; it describes the intended product, not a list of shipped
+> features. Section 0 and section 15 define the current execution order.
+> [Current status](CURRENT_STATUS.md) records exact artifacts and qualification.
 
-Version 0.1 — 1 August 2026
+Version 0.2 — 19 September 2026 (original architecture: 1 August 2026)
 Working brand: **KernAid**
 Physical product: **KernAid One**
 Primary tagline: **Diagnose. Repair. Verify.**
+
+## 0. Production checkpoint and immediate priority
+
+Development has resumed at the owner's request. This is no longer a Phase 0
+scaffolding task, and the old human-team calendar is not the execution plan.
+Work in integrated vertical batches, use parallel agents only for independent
+tasks, run focused checks during development and one exact-image matrix per
+release milestone. Use Node.js **24.18.0** and pnpm **9.15.9**.
+
+| Surface               | Actual state                                                                                                                                                      | Next production gate                                                                                                                                                            |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Consumer release      | `internal.6` is the stable diagnosis-only engineering preview. The newer `6e9742e` ISO is a private physical-test candidate, not a qualified persistence release. | Ship the network-first journey in a new image; verify visible UI, connectivity and offline continuation on the owner's PC.                                                      |
+| Network and reasoning | Pi, local SearXNG, Ethernet/Wi-Fi setup and compatible-provider selection are implemented in source. Default is Gemrouter / `gemini-3.8-flash`.                   | Package and boot the services in the exact ISO; verify a live response and search/failure handling. Source-level tests are not ISO evidence.                                    |
+| Repair                | Four narrow Linux handlers exist only in off-default candidates. The last combined repair run failed.                                                             | Resolve the recorded Vault/provider-proof gates, then qualify backup/apply/verify/rollback on the exact image. Do not enable repairs by default before promotion.               |
+| Enterprise            | Internal Fleet control plane, signed policy/license/audit and native Resident engineering packages exist.                                                         | Close one real enrollment → permitted work order → locally approved execution → signed result → audit loop; qualify signing, secret stores, backup restore and update rollback. |
+| Commercial delivery   | Separate retail and Enterprise public pages plus authenticated downloads exist. Neither offer is on sale.                                                         | Exact compatibility claims, signed artifacts, support/recovery procedures, license/third-party review, privacy and a functioning entitlement/payment lifecycle.                 |
+
+**Current vertical batch:** network-first Consumer Rescue. Start with a useful
+screen and connection/assistant or explicit offline mode; only then enumerate
+and select target disks. Fix the reported first-use stall before widening the
+repair catalog. Cloud availability is not assumed and cannot block offline
+diagnosis. A conversational assistant is not yet an autonomous repair engine.
+
+**Release truth:** `6e9742e` passed its integrated image/boot/USB tests but the
+separate UEFI Vault lifecycle failed readiness; `internal.7` was not promoted.
+The repair candidate `01cf8fe` failed UEFI crypttab provider proof. These gates
+stay open until a new exact artifact passes; they cannot be inferred from a
+green build or from unrelated older evidence.
+
+**Workspace:** `/home/funboy/kernaid` is the only active source checkout.
+Integrated scratch worktrees have been removed; live artifacts remain in
+`/home/funboy/KernAid-dist`, unique historical evidence in
+`/home/funboy/.local/share/kernaid-archive/2026-09-19`.
+See [workspace inventory and recovery](WORKSPACE_LAYOUT.md).
+
+The near-term target is a coherent RC within the owner's accelerated execution
+window, not a promise that external signing, physical tests or damaged hardware
+can be resolved by elapsed AI time. Report finished capabilities and named
+gates, not unverifiable completion percentages.
 
 ## 1. Executive decision
 
@@ -35,24 +75,29 @@ The LLM never receives unrestricted privileged shell access. A small privileged 
 
 ### 2.1 Product family
 
-| Product | What it is | First target |
-| --- | --- | --- |
-| KernAid One | Branded high-speed USB/portable SSD with Rescue, vault and workspace | Field technicians and MSPs |
-| KernAid Rescue | Immutable bootable Linux environment | x86-64 BIOS and UEFI PCs; Intel Macs where external boot is allowed |
-| KernAid Desk | Tauri desktop UI plus native privileged service | Windows 11, current Linux distributions, macOS |
-| KernAid Core | Local evidence, policy, session and action engine | Shared by Rescue and Desk |
-| KernAid WinPE Companion | Customer-built or properly licensed Windows PE image | Deep offline Windows repair |
-| KernAid Fleet | Optional device, policy and audit management | MSP and enterprise phase |
+| Product                 | What it is                                                           | First target                                                        |
+| ----------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| KernAid One             | Branded high-speed USB/portable SSD with Rescue, vault and workspace | Field technicians and MSPs                                          |
+| KernAid Rescue          | Immutable bootable Linux environment                                 | x86-64 BIOS and UEFI PCs; Intel Macs where external boot is allowed |
+| KernAid Desk            | Tauri desktop UI plus native privileged service                      | Windows 11, current Linux distributions, macOS                      |
+| KernAid Core            | Local evidence, policy, session and action engine                    | Shared by Rescue and Desk                                           |
+| KernAid WinPE Companion | Customer-built or properly licensed Windows PE image                 | Deep offline Windows repair                                         |
+| KernAid Fleet           | Optional device, policy and audit management                         | MSP and enterprise phase                                            |
 
-### 2.2 Target users
+### 2.2 Two customer journeys, one safety core
 
-- independent computer technicians;
-- MSP field staff;
-- sysadmins maintaining workstations and servers;
-- internal IT desks;
-- advanced users who understand approvals and backups.
+- **Consumer:** a non-technical owner whose PC will not start or work correctly.
+  Simple language, network/offline choice, guided diagnosis, clear next action,
+  explicit backup/approval and a readable report. Planned personal offer:
+  **€29.99**; payment/credit terms are a launch gate, not a current purchase.
+- **Enterprise:** internal IT, MSPs and technicians managing multiple machines.
+  Separate professional navigation and styling, device identity, restrictive
+  policy, licensing, signed results, audit, updates and support. Planned entry
+  offer: **$299/month**, with scope and service terms to be finalized.
 
-The consumer edition should expose only guided repair packs. Raw expert shell and high-risk actions belong in a separately gated technician mode.
+Both editions share Core/Broker protections. Neither exposes a privileged raw
+shell to the model. A price or Enterprise entitlement cannot override local
+approval, supported-action limits or data-preservation rules.
 
 ### 2.3 Core jobs to be done
 
@@ -95,7 +140,7 @@ dependency.
 
 Rollback appears after the first executed change when the repair pack supports it.
 
-~~~mermaid
+```mermaid
 stateDiagram-v2
     [*] --> Observe
     Observe --> Diagnose: Evidence complete
@@ -105,22 +150,28 @@ stateDiagram-v2
     Verify --> [*]: Target healthy
     Verify --> Rollback: Validation fails
     Rollback --> Diagnose
-~~~
+```
 
 ### 3.3 Boot-mode journey
 
 1. Boot KernAid One from BIOS/UEFI.
-2. Unlock the encrypted KernAid vault with a device PIN, passphrase or optional FIDO2 key.
-3. Connect Ethernet or Wi-Fi.
-4. Select or authenticate the reasoning provider.
-5. KernAid inventories hardware and disks with all host volumes read-only.
-6. The user selects the installed OS/target and optionally an accelerated workspace.
-7. KernAid creates a signed diagnostic snapshot.
-8. The user describes the problem.
-9. The agent collects additional evidence through read-only tools.
-10. KernAid presents a diagnosis and staged plan.
-11. The user reviews backup, risk and changed resources, then approves.
-12. KernAid executes through the privileged broker, verifies and exports a report.
+2. Show network adapters and Ethernet/Wi-Fi setup, with a visible offline option.
+3. Offer Gemrouter / `gemini-3.8-flash` by default, or configure another compatible
+   HTTPS provider. Credentials are not shipped in public images.
+4. Make the bounded Pi assistant available without waiting for disk selection.
+   It has web search, not shell access; provider/search failure has a deadline.
+5. After connection setup or explicit offline continuation, inventory hardware
+   and disks with all host volumes read-only.
+6. Select the target and describe the problem. No automatic disk provisioning.
+7. Collect structured evidence and produce the diagnosis/report. Unlock a
+   qualified encrypted Vault only when persistence or an approved action needs
+   it; do not require it to reach the first useful screen.
+8. For a separately qualified repair pack, show the staged plan, risk, backup
+   location and changed resources; require explicit local approval.
+9. Execute through Core/Broker, verify, offer rollback and export the report.
+
+Steps involving qualified persistence or repair remain release-gated; the
+current stable edition is diagnosis-only. See [network-first implementation](RESCUE_NETWORK_FIRST.md).
 
 ### 3.4 Resident-mode journey
 
@@ -134,31 +185,31 @@ If no provider is reachable, KernAid still performs local inventory, hardware te
 
 ### 4.1 Trust-separated architecture
 
-~~~mermaid
+```mermaid
 flowchart TD
     UI["KernAid Desk UI<br/>unprivileged"] --> GW["Agent Gateway<br/>LLM + session"]
     GW --> CORE["KernAid Core<br/>evidence + policy"]
     CORE --> BROKER["Privileged Broker<br/>typed actions only"]
     BROKER --> TARGET["Machine / mounted target"]
     CORE --> STORE["Encrypted journal<br/>snapshots + reports"]
-~~~
+```
 
 The gateway may ask a provider to reason about evidence. Only Core may create an execution intent. Only the broker may mutate the target.
 
 ### 4.2 Major components
 
-| Component | Technology | Responsibility |
-| --- | --- | --- |
-| Desktop shell | Tauri 2, React, TypeScript | Cross-platform window, machine UI, approvals, reports |
-| UI components | React, TanStack Query, xterm.js, Monaco only for logs/config/diffs | IDE-like experience without making source code the primary object |
-| Agent gateway | Node.js 24.18.0, TypeScript | Provider adapters, streaming, context assembly, structured response validation |
-| KernAid Core | Rust | Session state, evidence graph, policies, plan validation, audit journal |
-| Privileged broker | Rust | Unix socket / Windows named pipe / macOS XPC helper; least-privilege action execution |
-| Evidence store | SQLite plus content-addressed blobs | Immutable evidence, checksums, provenance and reports |
-| Credential vault | OS keychain in resident mode; LUKS2 vault in Rescue | Provider sessions, API keys, device identity |
-| Repair packs | Signed manifests plus Rust/PowerShell/shell helpers | OS-specific collectors, actions, validation and rollback |
-| Rescue image | Debian 13 live-build, immutable SquashFS or dm-verity | BIOS/UEFI boot, drivers and rescue tools |
-| Optional remote access | OAuth-protected MCP or outbound relay | Future technician collaboration, disabled by default |
+| Component              | Technology                                                         | Responsibility                                                                        |
+| ---------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| Desktop shell          | Tauri 2, React, TypeScript                                         | Cross-platform window, machine UI, approvals, reports                                 |
+| UI components          | React, TanStack Query, xterm.js, Monaco only for logs/config/diffs | IDE-like experience without making source code the primary object                     |
+| Agent gateway          | Node.js 24.18.0, TypeScript                                        | Provider adapters, streaming, context assembly, structured response validation        |
+| KernAid Core           | Rust                                                               | Session state, evidence graph, policies, plan validation, audit journal               |
+| Privileged broker      | Rust                                                               | Unix socket / Windows named pipe / macOS XPC helper; least-privilege action execution |
+| Evidence store         | SQLite plus content-addressed blobs                                | Immutable evidence, checksums, provenance and reports                                 |
+| Credential vault       | OS keychain in resident mode; LUKS2 vault in Rescue                | Provider sessions, API keys, device identity                                          |
+| Repair packs           | Signed manifests plus Rust/PowerShell/shell helpers                | OS-specific collectors, actions, validation and rollback                              |
+| Rescue image           | Debian 13 live-build, immutable SquashFS or dm-verity              | BIOS/UEFI boot, drivers and rescue tools                                              |
+| Optional remote access | OAuth-protected MCP or outbound relay                              | Future technician collaboration, disabled by default                                  |
 
 ### 4.3 Why Tauri plus Rust
 
@@ -178,39 +229,52 @@ The UI must never be able to send an arbitrary command string to the broker.
 
 ### 5.1 Production base
 
-Use **Debian 13 stable amd64 with live-build** as the production base. Debian 13.6 is the current stable point release on the research date and Debian documents live USB/hybrid image creation. Debian’s stable package base is preferable for a signed, reproducible commercial appliance.
+Use **Debian 13 stable amd64 with live-build** as the production base. Exact
+package versions and build inputs belong in each artifact's provenance; do not
+treat a historical point-release statement as the current build specification.
 
 Use **SystemRescue customization only for the initial prototype**. It already contains an excellent rescue toolbox and supports reproducible customization recipes, but SystemRescue stated in January 2026 that it does not support Secure Boot out of the box. Modern Windows hardware makes that a product blocker, so production must own and test its boot chain.
 
 ### 5.2 Boot targets
 
-| Target | Required v1 status |
-| --- | --- |
-| x86-64 UEFI | Required |
-| x86-64 UEFI Secure Boot | Release gate for commercial v1 |
-| Legacy BIOS on x86-64 | Required for technician coverage |
-| PXE/HTTP boot | Later fleet feature |
-| Intel Mac without external-boot restriction | Best effort, physical test required |
-| Intel Mac with T2 | Requires user to allow external boot in Apple Startup Security Utility |
-| Apple silicon | Not supported by the x86 image; separate arm64 project |
-| 32-bit x86 | Out of scope |
+| Target                                      | Required v1 status                                                     |
+| ------------------------------------------- | ---------------------------------------------------------------------- |
+| x86-64 UEFI                                 | Required                                                               |
+| x86-64 UEFI Secure Boot                     | Release gate for commercial v1                                         |
+| Legacy BIOS on x86-64                       | Required for technician coverage                                       |
+| PXE/HTTP boot                               | Later fleet feature                                                    |
+| Intel Mac without external-boot restriction | Best effort, physical test required                                    |
+| Intel Mac with T2                           | Requires user to allow external boot in Apple Startup Security Utility |
+| Apple silicon                               | Not supported by the x86 image; separate arm64 project                 |
+| 32-bit x86                                  | Out of scope                                                           |
 
 Secure Boot validation must use the exact shipping image and real firmware from multiple vendors. Do not claim support merely because shim, GRUB and the kernel are individually signed.
 
 ### 5.3 Device layout
 
-Recommended GPT layout for a 256 GB or larger device:
+The current retail `internal.6` image expands to **32,000,000,000 bytes**; some
+nominal 32 GB drives are smaller. The owner's 128 GB test device has sufficient
+nominal capacity, but creation tools must compare actual byte capacity before
+writing. The current shipping layout is the v2 three-partition format defined
+by `tools/make-device`, not the aspirational A/B layout below. Do not repartition
+existing customer media to match this table automatically.
 
-| Partition | Suggested size | Format | Purpose |
-| --- | ---: | --- | --- |
-| BIOS boot | 2 MiB | GRUB BIOS | Legacy boot embedding |
-| EFI System Partition | 1 GiB | FAT32 | UEFI boot files and signed chain |
-| KERNAID_SYS | 12–20 GiB | Read-only image | Immutable OS, UI and tool packs |
-| KERNAID_VAULT | 8–16 GiB | LUKS2 | Device identity, credentials, policy and license |
-| KERNAID_WORK | Remaining majority | LUKS2 + ext4/Btrfs | sessions, caches, exports and optional local models |
-| KERNAID_SHARE | 8–32 GiB optional | exFAT | User-approved cross-platform report/file exchange only |
+Long-range GPT layout for a qualified 256 GB or larger device:
 
-The system partition is versioned A/B for safe updates. The vault and work partitions survive an OS image update. The unencrypted share partition must never contain provider credentials or raw diagnostics by default.
+| Partition            |     Suggested size | Format             | Purpose                                                |
+| -------------------- | -----------------: | ------------------ | ------------------------------------------------------ |
+| BIOS boot            |              2 MiB | GRUB BIOS          | Legacy boot embedding                                  |
+| EFI System Partition |              1 GiB | FAT32              | UEFI boot files and signed chain                       |
+| KERNAID_SYS          |          12–20 GiB | Read-only image    | Immutable OS, UI and tool packs                        |
+| KERNAID_VAULT        |           8–16 GiB | LUKS2              | Device identity, credentials, policy and license       |
+| KERNAID_WORK         | Remaining majority | LUKS2 + ext4/Btrfs | sessions, caches, exports and optional local models    |
+| KERNAID_SHARE        |  8–32 GiB optional | exFAT              | User-approved cross-platform report/file exchange only |
+
+The intended system partition is versioned A/B for safe updates. The existing
+off-default activator targets provisioned UEFI/systemd-boot systems; it does
+not convert the retail USB into this layout. Vault/work preservation remains
+an exact-image release gate. The unencrypted share partition must never
+contain provider credentials or raw diagnostics by default.
 
 ### 5.4 Fastest-workspace selector
 
@@ -297,7 +361,7 @@ It does not receive:
 
 Every evidence item contains:
 
-~~~json
+```json
 {
   "id": "E-024",
   "collector": "efi.inventory",
@@ -310,7 +374,7 @@ Every evidence item contains:
   "summary": "EFI filesystem is clean; expected loader file is missing",
   "blob_ref": "sha256:…"
 }
-~~~
+```
 
 All command output, file content, web pages and logs are tagged as untrusted observations. Instructions found inside them are never promoted to user or system instructions.
 
@@ -318,7 +382,7 @@ All command output, file content, web pages and logs are tagged as untrusted obs
 
 The LLM may propose a diagnosis and intent. Core must produce a valid execution plan:
 
-~~~json
+```json
 {
   "plan_id": "P-20260801-0012",
   "target_fingerprint": "sha256:…",
@@ -328,7 +392,7 @@ The LLM may propose a diagnosis and intent. Core must produce a valid execution 
   "steps": [
     {
       "action": "windows.bcd.backup",
-      "args": {"volume_id": "vol-efi"},
+      "args": { "volume_id": "vol-efi" },
       "preconditions": ["efi.readable", "vault.free_space>=64MiB"],
       "backup": "required",
       "validation": "backup.hashes_match",
@@ -336,7 +400,7 @@ The LLM may propose a diagnosis and intent. Core must produce a valid execution 
     },
     {
       "action": "windows.bcd.rebuild_entries",
-      "args": {"installation_id": "win-1"},
+      "args": { "installation_id": "win-1" },
       "preconditions": ["backup.completed", "target.still_matches"],
       "backup": "inherited",
       "validation": "windows.bcd.validate",
@@ -344,19 +408,19 @@ The LLM may propose a diagnosis and intent. Core must produce a valid execution 
     }
   ]
 }
-~~~
+```
 
 The broker accepts action IDs and typed arguments, not raw shell. Expert shell is a distinct local mode with its own policy, explicit warning and complete logging.
 
 ### 6.4 Risk levels
 
-| Level | Examples | Default behavior |
-| --- | --- | --- |
-| R0 Observe | inventory, logs, SMART, read-only mount | Run automatically |
-| R1 Reversible | restart a service, change a temporary network route | One-click approval or managed policy |
-| R2 Configuration | edit service config, package repair, driver state | Explicit approval plus generated diff |
-| R3 System recovery | filesystem repair, bootloader, BCD, partition metadata | Required backup, target re-check and typed confirmation |
-| R4 Prohibited/general build | erase, credential bypass, firmware flash, destructive raw write | Disabled; separate specialist workflow if ever offered |
+| Level                       | Examples                                                        | Default behavior                                        |
+| --------------------------- | --------------------------------------------------------------- | ------------------------------------------------------- |
+| R0 Observe                  | inventory, logs, SMART, read-only mount                         | Run automatically                                       |
+| R1 Reversible               | restart a service, change a temporary network route             | One-click approval or managed policy                    |
+| R2 Configuration            | edit service config, package repair, driver state               | Explicit approval plus generated diff                   |
+| R3 System recovery          | filesystem repair, bootloader, BCD, partition metadata          | Required backup, target re-check and typed confirmation |
+| R4 Prohibited/general build | erase, credential bypass, firmware flash, destructive raw write | Disabled; separate specialist workflow if ever offered  |
 
 Account/password bypass and security-control circumvention are not MVP features.
 
@@ -398,16 +462,16 @@ The report distinguishes:
 
 ### 7.1 Realistic coverage
 
-| Capability | Linux boot mode | Windows disk from Linux | Intel macOS disk from Linux | Resident agent |
-| --- | --- | --- | --- | --- |
-| Hardware inventory/tests | Deep | Deep | Deep | Deep |
-| Disk health and imaging | Deep | Deep | Deep | Deep |
-| Partition/EFI inspection | Deep | Deep | Medium | Deep |
-| Filesystem read | Deep | Deep for NTFS/FAT | Limited for APFS | Native/deep |
-| Boot repair | Deep | Medium; WinPE preferred | Limited; Apple Recovery preferred | Native/deep |
-| Services/packages/drivers | Deep through chroot | Limited | Not appropriate | Native/deep |
-| Encrypted user data | LUKS with user key | BitLocker with recovery material | FileVault requires valid credentials/recovery | Native APIs |
-| Native system integrity tools | Linux tools | No DISM/SFC from Linux | No Apple-native repair | Yes |
+| Capability                    | Linux boot mode     | Windows disk from Linux          | Intel macOS disk from Linux                   | Resident agent |
+| ----------------------------- | ------------------- | -------------------------------- | --------------------------------------------- | -------------- |
+| Hardware inventory/tests      | Deep                | Deep                             | Deep                                          | Deep           |
+| Disk health and imaging       | Deep                | Deep                             | Deep                                          | Deep           |
+| Partition/EFI inspection      | Deep                | Deep                             | Medium                                        | Deep           |
+| Filesystem read               | Deep                | Deep for NTFS/FAT                | Limited for APFS                              | Native/deep    |
+| Boot repair                   | Deep                | Medium; WinPE preferred          | Limited; Apple Recovery preferred             | Native/deep    |
+| Services/packages/drivers     | Deep through chroot | Limited                          | Not appropriate                               | Native/deep    |
+| Encrypted user data           | LUKS with user key  | BitLocker with recovery material | FileVault requires valid credentials/recovery | Native APIs    |
+| Native system integrity tools | Linux tools         | No DISM/SFC from Linux           | No Apple-native repair                        | Yes            |
 
 ### 7.2 Linux repair packs
 
@@ -489,20 +553,20 @@ This matrix records the planned product decision as of the research date; it
 is not an implementation or qualification claim. The date-stamped
 [current status](CURRENT_STATUS.md) is authoritative for shipped behavior.
 
-| Provider mode | Product support | Authentication path | Decision |
-| --- | --- | --- | --- |
-| OpenAI API | Full embedded UI | Platform API key | Supported P0 |
-| Codex CLI with ChatGPT plan | Official CLI bridge | Browser login or beta device-code login | Supported P0/P1; isolate CODEX_HOME in encrypted vault |
-| Codex CLI with API key | Official CLI bridge | Key piped through official login or per-run credential | Supported |
-| Anthropic API / Agent SDK | Full embedded UI | Anthropic API key or enterprise provider | Supported P0 |
-| Claude Code subscription | External native CLI mode | Claude Code’s own login | Do not extract OAuth token; embedded commercial use requires terms review/agreement |
-| Gemini API | Full embedded UI | Gemini API key | Supported through direct adapter or compliant GemRouter profile |
-| Vertex AI | Full embedded UI | Google Cloud credentials/workload identity | Supported P1 enterprise |
-| Gemini CLI consumer Google login | Not reliable/available for the old individual tiers after 18 June 2026 | Deprecated by Google | Do not promise |
-| Gemini Code Assist Standard/Enterprise CLI | Official CLI bridge where the customer is entitled | Provider-managed Google login | P1 after integration test |
-| Pi runtime | Internal agent harness for API/local providers | Pi-supported API/key profiles | Strong prototype option, but replace default coding tools |
-| Local Ollama/llama.cpp | Full embedded UI | Local endpoint/token if configured | Supported P1/offline |
-| OpenAI-compatible LAN/router | Full embedded UI | Per-endpoint bearer/token | Supported; useful with GemRouterFE and the user’s local LLM servers |
+| Provider mode                              | Product support                                                        | Authentication path                                    | Decision                                                                            |
+| ------------------------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| OpenAI API                                 | Full embedded UI                                                       | Platform API key                                       | Supported P0                                                                        |
+| Codex CLI with ChatGPT plan                | Official CLI bridge                                                    | Browser login or beta device-code login                | Supported P0/P1; isolate CODEX_HOME in encrypted vault                              |
+| Codex CLI with API key                     | Official CLI bridge                                                    | Key piped through official login or per-run credential | Supported                                                                           |
+| Anthropic API / Agent SDK                  | Full embedded UI                                                       | Anthropic API key or enterprise provider               | Supported P0                                                                        |
+| Claude Code subscription                   | External native CLI mode                                               | Claude Code’s own login                                | Do not extract OAuth token; embedded commercial use requires terms review/agreement |
+| Gemini API                                 | Full embedded UI                                                       | Gemini API key                                         | Supported through direct adapter or compliant GemRouter profile                     |
+| Vertex AI                                  | Full embedded UI                                                       | Google Cloud credentials/workload identity             | Supported P1 enterprise                                                             |
+| Gemini CLI consumer Google login           | Not reliable/available for the old individual tiers after 18 June 2026 | Deprecated by Google                                   | Do not promise                                                                      |
+| Gemini Code Assist Standard/Enterprise CLI | Official CLI bridge where the customer is entitled                     | Provider-managed Google login                          | P1 after integration test                                                           |
+| Pi runtime                                 | Internal agent harness for API/local providers                         | Pi-supported API/key profiles                          | Strong prototype option, but replace default coding tools                           |
+| Local Ollama/llama.cpp                     | Full embedded UI                                                       | Local endpoint/token if configured                     | Supported P1/offline                                                                |
+| OpenAI-compatible LAN/router               | Full embedded UI                                                       | Per-endpoint bearer/token                              | Supported; useful with GemRouterFE and the user’s local LLM servers                 |
 
 ### 8.3 Codex bridge
 
@@ -704,12 +768,12 @@ For commercial use in Europe, plan GDPR roles, DPA terms, breach response, data-
 
 A cheap generic thumb drive is suitable only for demos. The production product should use SSD-class media.
 
-| Edition | Suggested device | Capacity | Expected purpose |
-| --- | --- | ---: | --- |
-| Prototype | Kingston DataTraveler Max-class USB 3.2 Gen 2 | 256–512 GB | Fast compact prototype; vendor rates the class up to 1000/900 MB/s |
-| KernAid One Pro | Rugged portable SSD such as Samsung T7 Shield class | 1 TB | Better endurance, sustained workspace and image storage |
-| Secure edition | PIN-authenticated hardware-encrypted SSD such as iStorage diskAshur M2 class | 500 GB–1 TB | Sensitive field work; slower but independent unlock |
-| Forensic edition | Separate read-only boot device plus hardware write blocker and destination SSD | 1 TB+ | Data recovery and evidence preservation |
+| Edition          | Suggested device                                                               |    Capacity | Expected purpose                                                   |
+| ---------------- | ------------------------------------------------------------------------------ | ----------: | ------------------------------------------------------------------ |
+| Prototype        | Kingston DataTraveler Max-class USB 3.2 Gen 2                                  |  256–512 GB | Fast compact prototype; vendor rates the class up to 1000/900 MB/s |
+| KernAid One Pro  | Rugged portable SSD such as Samsung T7 Shield class                            |        1 TB | Better endurance, sustained workspace and image storage            |
+| Secure edition   | PIN-authenticated hardware-encrypted SSD such as iStorage diskAshur M2 class   | 500 GB–1 TB | Sensitive field work; slower but independent unlock                |
+| Forensic edition | Separate read-only boot device plus hardware write blocker and destination SSD |       1 TB+ | Data recovery and evidence preservation                            |
 
 Vendor speed ratings are not guaranteed field performance. Qualify exact controller/NAND revisions, sustained writes, thermal throttling, boot compatibility and power draw before branding a batch.
 
@@ -771,7 +835,7 @@ At minimum:
 
 Repository name: **kernaid**
 
-~~~text
+```text
 kernaid/
 ├── AGENTS.md
 ├── README.md
@@ -850,7 +914,7 @@ kernaid/
     ├── threat-model/
     ├── support-matrix/
     └── runbooks/
-~~~
+```
 
 ### 13.1 Dependency policy
 
@@ -865,24 +929,33 @@ kernaid/
 
 The UI depends on:
 
-~~~ts
+```ts
 export interface SessionDriver {
   startSession(input: StartSession): Promise<SessionInfo>;
-  sendUserPrompt(sessionId: string, prompt: string): AsyncIterable<SessionEvent>;
-  requestEvidence(sessionId: string, request: EvidenceRequest): Promise<EvidenceRef[]>;
-  stagePlan(sessionId: string, proposal: DiagnosisProposal): Promise<ValidatedPlan>;
+  sendUserPrompt(
+    sessionId: string,
+    prompt: string,
+  ): AsyncIterable<SessionEvent>;
+  requestEvidence(
+    sessionId: string,
+    request: EvidenceRequest,
+  ): Promise<EvidenceRef[]>;
+  stagePlan(
+    sessionId: string,
+    proposal: DiagnosisProposal,
+  ): Promise<ValidatedPlan>;
   approvePlan(planId: string, approval: Approval): Promise<void>;
   executePlan(planId: string): AsyncIterable<ExecutionEvent>;
   rollback(planId: string): AsyncIterable<ExecutionEvent>;
   exportReport(sessionId: string, format: ReportFormat): Promise<ArtifactRef>;
 }
-~~~
+```
 
 No provider-specific event may leak directly into the UI. Normalize usage, reasoning status, tool requests, errors and cancellation.
 
 ### 13.3 Action pack manifest
 
-~~~yaml
+```yaml
 apiVersion: kernaid.dev/v1alpha1
 kind: ActionPack
 metadata:
@@ -900,7 +973,7 @@ spec:
       preflight: linux.fstab.preflight
       validate: linux.boot.validate-fstab
       rollback: linux.fstab.restore
-~~~
+```
 
 Handlers may call carefully controlled OS utilities, but their inputs are structured and their exact command construction is code-reviewed and tested.
 
@@ -910,7 +983,7 @@ Handlers may call carefully controlled OS utilities, but their inputs are struct
 
 The initial repository should expose these stable developer commands:
 
-~~~bash
+```bash
 just bootstrap
 just format
 just lint
@@ -923,7 +996,7 @@ just qemu-bios
 just qemu-uefi
 just qemu-secureboot
 just verify-release
-~~~
+```
 
 No test command may touch a physical block device. Hardware-lab commands require an explicit device serial, a lab-only flag and a second confirmation.
 
@@ -969,81 +1042,68 @@ The first commit should contain these non-negotiable instructions:
     home; KernAid never reads, copies, serializes or logs the CLI credential
     store.
 
-## 15. MVP scope and backlog
+## 15. Active production backlog
 
-### Phase 0 — Feasibility spike, 2 weeks
+Ship narrow, complete journeys instead of opening more scaffolding branches.
+The order below replaces the original calendar-based phase estimates.
 
-Deliver:
+### P0 — Network-first Consumer candidate (active)
 
-- branded SystemRescue-based prototype or Debian live image;
-- Tauri UI boots in QEMU;
-- hardware/storage inventory;
-- immutable evidence bundle;
-- prompt sent to one API provider;
-- diagnosis only, no mutations;
-- encrypted persistent vault;
-- proof of Codex CLI device login inside the live environment;
-- clear go/no-go report for Secure Boot and WebKit/GPU compatibility.
+- Build the integrated Pi/SearXNG/wizard batch into one new diagnosis ISO.
+- Show adapters, connect Ethernet/Wi-Fi and recover from wrong password, no
+  network, unavailable model or search timeout without trapping the user.
+- Preserve the explicit offline path; never infer target selection or consent.
+- Prove the new services start in the shipped image. Keep public artifacts
+  free of provider keys; private test credentials remain outside Git.
+- Publish only reviewed artifact bytes/hash/provenance, clearly distinguishing
+  a physical-test download from a promoted stable release.
+- Obtain one owner physical check: boot on the previously affected Intel PC,
+  visible first screen, network/offline choice, target selection, diagnosis.
 
-Exit criteria:
+Exit: a downloadable candidate that completes the first-use journey, with
+remaining gates stated accurately. Not an authorization to sell repairs.
 
-- boot from two physical x86 machines and QEMU BIOS/UEFI;
-- collect the same normalized snapshot in Rescue and Linux Resident mode;
-- zero writes to attached target image in Observe mode;
-- provider token survives reboot only inside encrypted vault.
+### P1 — Recoverable Consumer RC
 
-### Phase 1 — Rescue MVP, 8–10 weeks
+- Fix the exact Vault readiness failure before promising reboot persistence.
+- Close diagnosis → readable explanation → report export, including offline
+  operation and cancellation. Keep provider credentials out of reports.
+- Connect diagnostic evidence to the bounded assistant with explicit context
+  selection/redaction; current chat does not automatically see disk contents.
+- Qualify the existing narrow repair candidates together, including target
+  binding, separate backup, interrupted execution, verification and rollback.
+- Promote only actions supported by exact-image and physical evidence; keep
+  unsupported OS/actions explicit and diagnostic-only.
+- Make Media Creator/download/version recovery one coherent Windows journey.
 
-Deliver:
+### P2 — Enterprise design-partner RC
 
-- production Debian live-build pipeline;
-- UI, Core, broker and evidence store;
-- OpenAI API, Anthropic API, Gemini API/OpenAI-compatible provider adapters;
-- Codex official CLI bridge;
-- Workspace Accelerator;
-- P0 Linux diagnostic packs;
-- disk image/backup workflow;
-- staged plans and R0–R3 approvals;
-- Markdown/JSON report;
-- signed A/B updates;
-- QEMU test corpus.
+- Use existing Fleet and native Resident code, not a second control plane.
+- Demonstrate enrollment, trust anchors, restrictive policy and entitlement,
+  one closed work order, signed result and audit on actual native endpoints.
+- Qualify restore of the current schema-v13 Fleet backup and signed update
+  rollback, then document installation/revocation/offline behavior.
+- Sign/notarize installers using the owner's approved publisher identities;
+  engineering packages remain visibly unsigned until this is done.
+- Keep local repair approval mandatory; Fleet cannot grant arbitrary shell or
+  turn a diagnosis-only endpoint into a repair-capable one.
 
-### Phase 2 — Common repair, 8–10 weeks
+### P3 — Commercial release
 
-Deliver:
+- Exact supported-hardware/OS/action matrix, known limitations and escalation
+  path; diagnose hardware faults, do not claim to physically repair components.
+- Finalize Consumer credit/refund and Enterprise seat/device/support terms;
+  wire payment events idempotently to entitlement issuance/revocation.
+- Versioned terms, privacy/data-retention controls, provider/subprocessor and
+  third-party distribution review, SBOM/notices, recovery/support procedures.
+- Signed release/update artifacts with stable rollback and one trusted catalog
+  feeding the site, Media Creator and installed clients.
+- Change public calls to action from preview to purchase only when the offer
+  really works end to end and the owner approves its commercial terms.
 
-- reversible Linux repair packs;
-- Windows offline evidence packs;
-- BCD/EFI backup and carefully limited repair;
-- resident Linux agent;
-- resident Windows service and UI;
-- restore/rollback;
-- local Ollama/llama.cpp endpoint;
-- hardware beta with 20–50 technicians.
-
-### Phase 3 — Native depth, 10–14 weeks
-
-Deliver:
-
-- WinPE builder/companion after Microsoft licensing review;
-- DISM/SFC/update/driver Windows packs;
-- macOS resident helper, signing and notarization;
-- Intel Mac rescue validation;
-- enterprise provider profiles;
-- Fleet enrollment and policy beta;
-- formal penetration test and recovery drill.
-
-### Phase 4 — Commercial release
-
-Deliver:
-
-- qualified hardware batch;
-- signed installers and rescue image;
-- support portal, updater and revocation;
-- product terms, privacy, DPA and incident response;
-- repair-pack marketplace policy;
-- public compatibility database;
-- trademark clearance and final brand assets.
+Windows-native mutation, WinPE distribution, broader macOS repairs, remote
+support and additional hardware families are subsequent supported packs, not
+reasons to delay a truthful narrower first launch or claim universal coverage.
 
 ## 16. Acceptance criteria
 
@@ -1085,7 +1145,17 @@ Target beta metrics:
 - logout removes the selected provider profile;
 - local diagnostics remain available when every provider is offline.
 
-## 17. Team, timing and budget
+## 17. Delivery capacity and external dependencies
+
+The historical human-team estimates below are reference context, not the
+active AI execution schedule, a quote or a forecast of remaining work. Use
+section 15 and the [RC execution plan](RC_EXECUTION_PLAN.md) for delivery.
+The owner's seven-active-day target is an internal RC objective; physical
+access, publisher certificates, commercial decisions and provider availability
+must be tracked separately from implementation work. Do not report a launch
+date or completion percentage without naming those dependencies.
+
+### Historical planning assumptions (1 August 2026)
 
 ### 17.1 Lean prototype
 
@@ -1135,15 +1205,15 @@ All figures are planning ranges, not supplier quotations.
 
 ## 18. Commercial model hypothesis
 
-Validate with technicians before final pricing:
+The two current offers are hypotheses already shown on the separate public
+retail and Enterprise pages; they are **not available for purchase**:
 
-| Offer | Hypothesis |
-| --- | --- |
-| KernAid One Starter | €149–€199 device, limited packs, BYO provider |
-| KernAid One Pro | €279–€399 rugged 1 TB kit |
-| KernAid Pro subscription | €29–€59 per technician/month for updates, packs and reports |
-| KernAid Fleet | €79–€149 per technician/month with policy, audit and team controls |
-| Provider usage | BYO account/key by default; optional metered credits only with explicit provider agreements |
+| Offer          | Hypothesis                                                                                                                    |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Consumer       | €29.99 personal repair credit; exact eligibility, expiry, included usage and refund policy remain launch decisions            |
+| Enterprise     | From $299/month; devices/seats, SLA, support and optional physical appliance must be specified before sale                    |
+| Hardware       | Optional qualified USB/SSD kit; not silently included in software pricing                                                     |
+| Provider usage | BYO key for engineering builds; included/metered usage requires a defined budget, controls and applicable provider agreements |
 
 The hardware creates trust and a simple field workflow. Recurring value comes from tested repair packs, compatibility updates, signed images, reports and fleet policy, not from reselling consumer AI subscriptions.
 
@@ -1172,26 +1242,26 @@ The supplied kit includes SVG logo masters, tokens, app concept, social cover, p
 
 ## 20. Principal risks and decisions
 
-| Risk | Impact | Mitigation/decision |
-| --- | --- | --- |
-| LLM destroys data | Existential | No root shell; typed broker; read-only default; backups and approval |
-| Secure Boot incompatibility | High | Debian production base; real-hardware release gate |
-| Windows repairs incomplete from Linux | High | Resident Windows plus WinPE companion |
-| Apple coverage overclaimed | High | Intel-only boot claim; native Apple path; arm64 separate |
-| Provider OAuth/terms change | High | Capability registry; official CLI/API paths; no token extraction |
-| Lost USB leaks credentials | High | LUKS2, optional FIDO2, revocation and no plaintext share |
-| Rescue image becomes stale | High | A/B signed updater, compatibility database and monthly qualification |
-| Repair pack bug | High | Signed packs, fixtures, failure injection and staged rollout |
-| Malicious logs prompt-inject agent | High | Treat evidence as untrusted; instruction/data separation |
-| Cheap flash failure | Medium/high | SSD-class qualified media and boot integrity verification |
-| Scope explodes across OSes | High | Linux-first core, Windows next, macOS resident later |
+| Risk                                  | Impact      | Mitigation/decision                                                  |
+| ------------------------------------- | ----------- | -------------------------------------------------------------------- |
+| LLM destroys data                     | Existential | No root shell; typed broker; read-only default; backups and approval |
+| Secure Boot incompatibility           | High        | Debian production base; real-hardware release gate                   |
+| Windows repairs incomplete from Linux | High        | Resident Windows plus WinPE companion                                |
+| Apple coverage overclaimed            | High        | Intel-only boot claim; native Apple path; arm64 separate             |
+| Provider OAuth/terms change           | High        | Capability registry; official CLI/API paths; no token extraction     |
+| Lost USB leaks credentials            | High        | LUKS2, optional FIDO2, revocation and no plaintext share             |
+| Rescue image becomes stale            | High        | A/B signed updater, compatibility database and monthly qualification |
+| Repair pack bug                       | High        | Signed packs, fixtures, failure injection and staged rollout         |
+| Malicious logs prompt-inject agent    | High        | Treat evidence as untrusted; instruction/data separation             |
+| Cheap flash failure                   | Medium/high | SSD-class qualified media and boot integrity verification            |
+| Scope explodes across OSes            | High        | Linux-first core, Windows next, macOS resident later                 |
 
-## 21. Immediate implementation order
+## 21. Original implementation sequence (historical)
 
 This is the original implementation sequence, retained as historical product
 context. See [current status](CURRENT_STATUS.md) for completed and open gates;
-item 11 is implemented only inside the isolated fixture repair lab, not on
-production targets.
+the four current repair candidates remain off-default and unpromoted. Do not
+restart this sequence: section 15 is the active backlog.
 
 1. Create the kernaid monorepo and commit this document plus AGENTS.md.
 2. Scaffold Tauri/React UI and Rust workspace.
@@ -1209,44 +1279,18 @@ production targets.
 11. Implement the first reversible action: backup and repair one controlled Linux configuration fixture.
 12. Only then add broader provider and OS packs.
 
-## 22. Kickoff prompt for the coding agent
+## 22. Continuation instructions
 
-Copy this prompt into the agent that will scaffold the repository:
+Use [AI product-completion directive](AI_PRODUCT_COMPLETION_DIRECTIVE.md) and
+section 15. Read `AGENTS.md`, `CURRENT_STATUS.md` and the affected implementation
+before changing code. Continue from the canonical checkout; do not scaffold
+another repository or revive an obsolete worktree.
 
-~~~text
-You are the lead engineer implementing KernAid from the masterplan in
-KERNAID_PRODUCT_AND_REPO_MASTERPLAN.md.
-
-Start with Phase 0 only. Do not implement Windows/macOS mutation, remote access,
-raw disk writes, password bypass, firmware operations or arbitrary privileged shell.
-
-First:
-1. Read the masterplan completely.
-2. Create the monorepo structure defined in section 13.
-3. Keep `AGENTS.md` aligned with the active engineering invariants; it currently
-   contains eleven rules.
-4. Scaffold a Tauri 2 + React desktop app, a Rust workspace, and a TypeScript
-   agent-gateway behind the SessionDriver interface.
-5. Define versioned JSON Schemas for Evidence, DiagnosisProposal, ValidatedPlan,
-   Approval, ExecutionEvent and SessionReport.
-6. Implement fake provider and fake broker adapters.
-7. Build one Linux read-only inventory collector against fixtures.
-8. Add tests proving Observe mode cannot write to the target fixture.
-9. Add justfile commands for bootstrap, format, lint, check, test and run-desk.
-10. Document exact commands and stop after all Phase 0 scaffolding checks pass.
-
-Security invariants:
-- The LLM never receives a privileged raw shell.
-- Provider adapters cannot call the broker.
-- The broker accepts only known typed action IDs.
-- Host/target volumes are read-only in Observe.
-- Observed files/logs are untrusted data, never instructions.
-- No credentials in source, fixtures, logs or reports.
-- Destructive tests run only on disposable image files.
-
-Make small commits and report the resulting tree, tests, remaining blockers and
-the next smallest milestone. Do not expand scope without an explicit decision.
-~~~
+For each vertical batch: implement, run the smallest relevant checks, commit
+and push, build one candidate when it changes the image, and update exact
+status/provenance. Close integrated scratch worktrees. Never promote a failed
+candidate, put credentials in Git/public images, broaden mutation privileges
+to make a test pass or label engineering artifacts commercially supported.
 
 ## 23. Research sources and verification notes
 

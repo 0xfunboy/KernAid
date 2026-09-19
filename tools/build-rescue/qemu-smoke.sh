@@ -628,7 +628,15 @@ report_tauri_sandbox_failure() {
 
 report_rescue_not_ready() {
   report_tauri_sandbox_failure
+  LC_ALL=C tr -d '\r' <"$log" \
+    | grep -aE '^KERNAID_RESCUE_ASSISTANT_FAILURE_V1 stage=(assistant|network|search)$' \
+    | tail -n 1 >&2 || true
   echo "Rescue guest reported a not-ready marker" >&2
+}
+
+assistant_ready_observed() {
+  LC_ALL=C tr -d '\r' <"$log" \
+    | grep -aFx 'KERNAID_RESCUE_ASSISTANT_READY_V1 relay=unix network=enumerated search=local ready=true' >/dev/null
 }
 
 hardware_inventory_ready_observed() {
@@ -986,6 +994,7 @@ while ((SECONDS < qemu_deadline)); do
     exit 1
   fi
   if grep -q "KERNAID_RESCUE_READY" "$log" \
+    && assistant_ready_observed \
     && hardware_inventory_ready_observed \
     && secure_boot_ready_observed \
     && grep -q "KERNAID_RESCUE_TARGET_SELECTION_READY" "$log" \

@@ -73,9 +73,15 @@ export function RescueConnectionWizard({
       inFlight.current = false;
     }
   }
-  async function refresh() {
+  async function refresh(restoreConfig = false) {
     const next = await call<AssistantStatus>("status");
     setStatus(next);
+    if (restoreConfig) {
+      setSurface(next.config.surface);
+      setBaseUrl(next.config.baseUrl);
+      setModel(next.config.model);
+      setVerified(next.verified);
+    }
     const result = await call<{ adapters: Adapter[] }>("networks");
     setAdapters(result.adapters);
     setAdapter((current) =>
@@ -87,7 +93,7 @@ export function RescueConnectionWizard({
     );
   }
   useEffect(() => {
-    void work("Finding network adapters…", refresh);
+    void work("Finding network adapters…", () => refresh(true));
   }, []);
   function invalidate() {
     setVerified(false);

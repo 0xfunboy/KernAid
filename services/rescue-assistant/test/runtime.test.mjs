@@ -81,6 +81,21 @@ test("actual Pi session has only web_search, no shell or file tools", async () =
   }
 });
 
+test("switching providers cannot send a custom endpoint key to the default endpoint", async () => {
+  const runtime = new AssistantRuntime({ stateDir: "/unused", searchUrl: "" });
+  await runtime.configure({
+    surface: "gemrouter",
+    baseUrl: "https://custom.example/v1",
+    model: "test",
+    apiKey: "synthetic-custom-test-only",
+  });
+  await runtime.configure({ surface: "openai", model: "test" });
+  await runtime.configure({ surface: "gemrouter", model: "test" });
+  assert.equal(runtime.status().credentialPresent, false);
+  await assert.rejects(runtime.models(), /Enter an API key/);
+  await assert.rejects(runtime.createSession(), /enter its API key/);
+});
+
 test("Gemrouter text protocol accepts only the bounded search operation", () => {
   assert.equal(
     parseSearchRequest('{"web_search":"NetworkManager docs"}'),

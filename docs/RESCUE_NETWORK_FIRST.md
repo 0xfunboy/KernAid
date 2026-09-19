@@ -1,7 +1,25 @@
 # Rescue network-first assistant
 
-Implementation checkpoint: 18 September 2026. This source change is not yet
+Implementation checkpoint: 19 September 2026. This source change is not yet
 included in a newly qualified ISO; existing private downloads are unchanged.
+
+The production-preparation batch binds credentials to their exact endpoint,
+restores the active provider/model when reopening the wizard and permits the
+dedicated daemon to create NetworkManager live-system profiles. Private NM
+profiles require a login session and cannot be used by this headless account.
+Wi-Fi passwords travel on stdin, not argv; profiles belong to the live OS,
+not a target disk or the KernAid Vault. General live-overlay persistence is
+not qualified by this change. Provider keys entered in the wizard remain
+in-memory; the private development key is a separate service credential.
+
+Pi staging now includes only runtime files and checks import on both the build
+host and target Debian chroot; the chroot also checks the pinned SearXNG import.
+Seven focused runtime tests and the Desk production build passed locally.
+The existing QEMU smoke now additionally requires a running local HTTP-to-Unix
+assistant relay, successful NetworkManager enumeration, SearXNG `/healthz`
+and both systemd services active. It does not call a remote model or search
+engine. Local probe/marker contract checks passed; the exact ISO run remains
+the evidence for actual guest startup.
 
 The owner reported a physical boot reaching the desktop and two installed-system
 candidates, then apparently stopping after selection. No device logs establish
