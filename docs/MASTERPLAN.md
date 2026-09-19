@@ -32,8 +32,9 @@ and select target disks. Fix the reported first-use stall before widening the
 repair catalog. Cloud availability is not assumed and cannot block offline
 diagnosis. A conversational assistant is not yet an autonomous repair engine.
 
-**19 September continuation:** the `53afa5a` image build is running. The next
-source batch adds a review-and-consent path for a minimal inspection summary
+**19 September continuation:** the `53afa5a` ISO was built and passed QEMU BIOS
+smoke, including assistant readiness; the remaining release jobs are running
+or pending. The source batch through `f464b5a` adds a review-and-consent path for a minimal inspection summary
 to Pi; it is not part of that running image. The current-schema Enterprise
 offline backup/restore gate is now verified against a real signed v13 bundle
 without changing the live database. Readiness failures now have closed static

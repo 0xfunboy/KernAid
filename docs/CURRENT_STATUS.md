@@ -21,6 +21,10 @@ dispatched on 19 September and **in progress at this checkpoint**. Only this
 Rescue cohort was dispatched; unrelated platform rebuilds were not started.
 The new guest gate checks the live Pi relay, network enumeration and local
 SearXNG health. No new artifact is promoted or available for download yet.
+At the latest reviewed job checkpoint, hybrid ISO construction and QEMU BIOS
+smoke passed, including the mandatory assistant-readiness gate; UEFI Secure
+Boot was running and the two-boot USB/Vault gates remained pending. This is
+not physical hardware evidence or a completed release qualification.
 
 The subsequent source batch adds an explicitly previewed, per-question
 inspection summary for Pi, with a closed identifier-free schema and isolated
@@ -28,6 +32,10 @@ conversation. It also preserves static readiness failure codes in Vault
 lifecycle logs. Neither change is in the running `53afa5a` image. The previous
 Vault failure's detailed artifact has expired; its exact cause remains open,
 not claimed fixed by the diagnostic improvement.
+This source batch is pushed through `f464b5a`; its isolated production
+assistant bundle imports successfully and focused contract/UI/runtime checks
+plus the Desk build pass. It will need a new exact-image cohort after review
+of the already-running build; no duplicate ISO run was started here.
 
 Gemrouter live qualification is still open: the 19 September synthetic Pi
 request timed out at 60 s, and direct non-streaming chat (20 s) and model
