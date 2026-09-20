@@ -90,18 +90,18 @@ including any search turns.
 The Gemrouter profile uses a dedicated Pi transport because the SDK's stock
 OpenAI Completions adapter requests streaming. The verified gateway contract is:
 
-| Setting | KernAid value |
-| --- | --- |
-| API base | `https://gemr.airewardrop.xyz/v1` |
-| Completion | `POST /v1/chat/completions`, `stream: false` |
-| Authentication | Endpoint-bound `Authorization: Bearer` service credential |
-| Backend | `x-gemrouter-backend: gemini-api` |
-| Model | `gemini-3.8-flash`, no automatic model/backend fallback |
-| Output limit | `max_tokens: 2048` for normal answers; 64 only in the direct probe |
-| Deadlines | 10 s DNS/TCP/TLS connection, 120 s complete HTTP request |
-| Budget | At most 2 in-flight HTTP requests and 30 starts per rolling minute, process-wide |
-| Retries | None; exceeded budgets fail locally instead of queuing |
-| Discovery | Once at service startup, cached; explicit Load models refresh is available |
+| Setting        | KernAid value                                                                                       |
+| -------------- | --------------------------------------------------------------------------------------------------- |
+| API base       | `https://gemr.airewardrop.xyz/v1`                                                                   |
+| Completion     | `POST /v1/chat/completions`, `stream: false`                                                        |
+| Authentication | Endpoint-bound `Authorization: Bearer` service credential                                           |
+| Backend        | `x-gemrouter-backend: gemini-api`                                                                   |
+| Model          | `gemini-3.8-flash`, no automatic model/backend fallback                                             |
+| Output limit   | `max_tokens: 2048` for normal answers; 64 only in the direct probe                                  |
+| Deadlines      | 10 s DNS/TCP/TLS connection, 120 s complete HTTP request                                            |
+| Budget         | At most 2 in-flight HTTP requests and 30 starts per rolling minute, process-wide                    |
+| Retries        | None; exceeded budgets fail locally instead of queuing                                              |
+| Discovery      | Once after a connected adapter exists at startup, cached; explicit Load models refresh is available |
 
 The transport appends `/models` or `/chat/completions` to the selected base,
 never another `/v1`. It sends no Origin, cookie, OAuth, Codex credentials,
@@ -110,10 +110,12 @@ response JSON are bounded to 512 KiB. Pi still owns the conversation; the
 adapter is not a replacement harness. Other provider profiles retain their
 existing compatible transport.
 
-Startup discovery runs in the background and does not block local status,
-network selection or offline diagnosis. Successful results are reused when
-selecting another model on the same endpoint/key. A changed provider, endpoint
-or credential invalidates them; a late response cannot populate a new profile.
+Connected-startup discovery runs in the background and does not block local
+status, network selection or offline diagnosis. With no usable adapter it is
+deferred until a successful connection or provider configuration. Successful
+results are reused when selecting another model on the same endpoint/key. A
+changed provider, endpoint or credential invalidates them; a late response
+cannot populate a new profile.
 After an offline startup, connecting an adapter or explicitly configuring the
 provider can start a fresh discovery. Chat itself never discovers models.
 The local IPC, HTTP relay and browser deadlines are 125, 135 and 140 seconds

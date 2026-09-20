@@ -8,8 +8,31 @@ import {
   AssistantRuntime,
   endpoint,
   splitNmcli,
+  hasConnectedNetwork,
   parseSearchRequest,
 } from "../runtime.mjs";
+
+test("provider discovery waits for a usable network adapter", () => {
+  assert.equal(hasConnectedNetwork({ adapters: [] }), false);
+  assert.equal(
+    hasConnectedNetwork({
+      adapters: [{ name: "lo", type: "loopback", state: "connected" }],
+    }),
+    false,
+  );
+  assert.equal(
+    hasConnectedNetwork({
+      adapters: [{ name: "eth0", type: "ethernet", state: "disconnected" }],
+    }),
+    false,
+  );
+  assert.equal(
+    hasConnectedNetwork({
+      adapters: [{ name: "wlan0", type: "wifi", state: "connected" }],
+    }),
+    true,
+  );
+});
 
 test("reject credential-bearing/insecure endpoints and preserve escaped Wi-Fi names", () => {
   for (const value of [

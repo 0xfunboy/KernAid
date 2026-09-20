@@ -15,7 +15,13 @@ wizard configuration restoration and production Pi/SearXNG packaging. The
 local runtime checks and Desk build passed; a new exact-image qualification
 is still required before changing the stable download.
 
-New private testing candidate: source `25b88fc3348999dc8dd4e2d3d70330b4b186e832`,
+Latest private rebuild: source `7134b6e36d2b09cd1c10bcdd939a91601aa23f08`,
+[Rescue run 35419841920](https://github.com/0xfunboy/KernAid/actions/runs/35419841920),
+with the staging permission fix and encrypted diagnostic retention. Image
+construction passed; the BIOS gate failed at the local assistant probe. The site
+download remains unchanged until a successor passes every exact boot gate.
+
+Previous private testing candidate: source `25b88fc3348999dc8dd4e2d3d70330b4b186e832`,
 [Rescue run 35418581057](https://github.com/0xfunboy/KernAid/actions/runs/35418581057),
 dispatched with `private_testing=true`. It integrates the network-first wizard,
 consented summaries and verified Gemini-backed Pi transport. Image construction
@@ -28,6 +34,11 @@ runtime staging uses `022`, private files retain explicit `0600`, and the
 target-distribution preflight checks asset access bits before boot. All 389
 image-tooling checks pass locally. Failed smoke output is now retained privately
 with the exact gate outcomes, without allowing failed images into downloads.
+The retained BIOS log then identified `assistant-probe`: both Pi and SearXNG
+services started, but the private credential caused provider discovery before
+the no-NIC QEMU guest had a usable adapter. Automatic discovery is now gated on
+a connected Ethernet/Wi-Fi adapter and remains triggered after wizard
+connection/configuration; offline status and diagnosis stay immediately usable.
 The first private dispatch, `35418400202`, stopped before image creation on
 one stale exact-package-list assertion. The `gnupg` expectation was updated
 without changing the OVMF hardening checks; the focused regression passes.

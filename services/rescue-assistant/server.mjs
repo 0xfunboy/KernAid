@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   AssistantRuntime,
   networks,
+  hasConnectedNetwork,
   wifi,
   connectNetwork,
 } from "./runtime.mjs";
@@ -110,5 +111,13 @@ server.maxConnections = 8;
 server.listen(socketPath, async () => {
   await fs.chmod(socketPath, 0o660);
   console.log("KernAid assistant ready (local Unix socket)");
-  runtime.startDiscovery();
+  // A private test credential can exist before the live environment has any
+  // network. Keep the local status/diagnosis path immediately available and
+  // discover only when NetworkManager reports a usable adapter. Successful
+  // wizard connect/configure operations trigger the same cached discovery.
+  void networks()
+    .then((state) => {
+      if (hasConnectedNetwork(state)) runtime.startDiscovery();
+    })
+    .catch(() => {});
 });

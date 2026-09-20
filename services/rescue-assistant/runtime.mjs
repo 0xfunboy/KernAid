@@ -50,6 +50,18 @@ export function splitNmcli(line) {
   return fields;
 }
 
+export function hasConnectedNetwork(value) {
+  return Boolean(
+    Array.isArray(value?.adapters) &&
+    value.adapters.some(
+      (adapter) =>
+        adapter &&
+        ["ethernet", "wifi"].includes(adapter.type) &&
+        adapter.state === "connected",
+    ),
+  );
+}
+
 export function parseSearchRequest(text) {
   try {
     const value = JSON.parse(text.trim());
