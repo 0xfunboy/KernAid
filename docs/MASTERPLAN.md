@@ -1,11 +1,11 @@
 # KernAid — Product, Architecture and Repository Masterplan
 
-> Active production plan, updated 19 September 2026. The original architecture
+> Active production plan, updated 20 September 2026. The original architecture
 > is retained below; it describes the intended product, not a list of shipped
 > features. Section 0 and section 15 define the current execution order.
 > [Current status](CURRENT_STATUS.md) records exact artifacts and qualification.
 
-Version 0.2 — 19 September 2026 (original architecture: 1 August 2026)
+Version 0.2 — 20 September 2026 (original architecture: 1 August 2026)
 Working brand: **KernAid**
 Physical product: **KernAid One**
 Primary tagline: **Diagnose. Repair. Verify.**
@@ -18,19 +18,21 @@ Work in integrated vertical batches, use parallel agents only for independent
 tasks, run focused checks during development and one exact-image matrix per
 release milestone. Use Node.js **24.18.0** and pnpm **9.15.9**.
 
-| Surface               | Actual state                                                                                                                                                      | Next production gate                                                                                                                                                            |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Consumer release      | `internal.6` is the stable diagnosis-only engineering preview. The newer `6e9742e` ISO is a private physical-test candidate, not a qualified persistence release. | Ship the network-first journey in a new image; verify visible UI, connectivity and offline continuation on the owner's PC.                                                      |
-| Network and reasoning | Pi, local SearXNG, Ethernet/Wi-Fi setup and compatible-provider selection are implemented in source. Default is Gemrouter / `gemini-3.8-flash`.                   | Package and boot the services in the exact ISO; verify a live response and search/failure handling. Source-level tests are not ISO evidence.                                    |
-| Repair                | Four narrow Linux handlers exist only in off-default candidates. The last combined repair run failed.                                                             | Resolve the recorded Vault/provider-proof gates, then qualify backup/apply/verify/rollback on the exact image. Do not enable repairs by default before promotion.               |
-| Enterprise            | Internal Fleet control plane, signed policy/license/audit and native Resident engineering packages exist.                                                         | Close one real enrollment → permitted work order → locally approved execution → signed result → audit loop; qualify signing, secret stores, backup restore and update rollback. |
-| Commercial delivery   | Separate retail and Enterprise public pages plus authenticated downloads exist. Neither offer is on sale.                                                         | Exact compatibility claims, signed artifacts, support/recovery procedures, license/third-party review, privacy and a functioning entitlement/payment lifecycle.                 |
+| Surface               | Actual state                                                                                                                                                              | Next production gate                                                                                                                                                            |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Consumer release      | `internal.6` remains stable. Private candidate `da74410` passed the integrated BIOS/UEFI/Secure Boot/snapshot/USB two-boot matrix and is available behind authentication. | Verify visible UI, Ethernet/Wi-Fi, offline continuation, target selection and diagnosis on the owner's previously affected Intel PC.                                            |
+| Network and reasoning | Pi, local SearXNG, Ethernet/Wi-Fi setup and compatible-provider selection ship in private candidate `da74410`; default is Gemrouter / `gemini-3.8-flash`.                 | Verify a live answer, search and bounded failure handling from the physical candidate; virtual boot readiness alone is not provider-path evidence.                              |
+| Repair                | Four narrow Linux handlers exist only in off-default candidates. The last combined repair run failed.                                                                     | Resolve the recorded Vault/provider-proof gates, then qualify backup/apply/verify/rollback on the exact image. Do not enable repairs by default before promotion.               |
+| Enterprise            | Internal Fleet control plane, signed policy/license/audit and native Resident engineering packages exist.                                                                 | Close one real enrollment → permitted work order → locally approved execution → signed result → audit loop; qualify signing, secret stores, backup restore and update rollback. |
+| Commercial delivery   | Separate retail and Enterprise public pages plus authenticated downloads exist. Neither offer is on sale.                                                                 | Exact compatibility claims, signed artifacts, support/recovery procedures, license/third-party review, privacy and a functioning entitlement/payment lifecycle.                 |
 
 **Current vertical batch:** network-first Consumer Rescue. Start with a useful
 screen and connection/assistant or explicit offline mode; only then enumerate
 and select target disks. Fix the reported first-use stall before widening the
 repair catalog. Cloud availability is not assumed and cannot block offline
-diagnosis. A conversational assistant is not yet an autonomous repair engine.
+diagnosis. The downloadable private image is complete; physical validation is
+the remaining gate. A conversational assistant is not yet an autonomous repair
+engine.
 
 **19 September continuation:** the `53afa5a` ISO passed its complete base build,
 BIOS/UEFI Secure Boot and USB-style two-boot matrix, including assistant
@@ -54,9 +56,9 @@ green build or from unrelated older evidence.
 and the actual Pi daemon are verified from this VPS with `/v1`, explicit
 Gemini backend, non-streaming requests and 120 s deadlines. Startup model
 discovery is cached; no retries or backend/model fallback are enabled. The
-live Pi → SearXNG → answer chain also passed. Carry this source update into
-the next exact-image cohort; existing ISO downloads are not modified by a
-daemon restart. See [verification details](RESCUE_NETWORK_FIRST.md).
+live Pi → SearXNG → answer chain also passed. This source update is included in
+the exact private image cohort completed by run `35489376408`; stable downloads
+are not modified. See [verification details](RESCUE_NETWORK_FIRST.md).
 
 **Workspace:** `/home/funboy/kernaid` is the only active source checkout.
 Integrated scratch worktrees have been removed; live artifacts remain in
@@ -1067,9 +1069,10 @@ The first commit should contain these non-negotiable instructions:
 Ship narrow, complete journeys instead of opening more scaffolding branches.
 The order below replaces the original calendar-based phase estimates.
 
-### P0 — Network-first Consumer candidate (active)
+### P0 — Network-first Consumer candidate (physical check pending)
 
-- Build the integrated Pi/SearXNG/wizard batch into one new diagnosis ISO.
+- Built the integrated Pi/SearXNG/wizard batch into private candidate
+  `da74410`; its exact integrated image matrix passed in run `35489376408`.
 - Show adapters, connect Ethernet/Wi-Fi and recover from wrong password, no
   network, unavailable model or search timeout without trapping the user.
 - Preserve the explicit offline path; never infer target selection or consent.

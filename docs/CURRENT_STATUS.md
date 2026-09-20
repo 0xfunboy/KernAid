@@ -1,21 +1,30 @@
 # KernAid current status
 
-Last updated: 19 September 2026
+Last updated: 20 September 2026
 
-New source checkpoint: Rescue starts with network setup and a Pi assistant
-using Gemrouter `gemini-3.8-flash`, selectable compatible providers and local
-SearXNG search. This change is not in a newly qualified ISO. Existing release
-evidence below is the 1 September checkpoint. See
+New private physical-test candidate: Rescue starts with network setup and a Pi
+assistant using Gemrouter `gemini-3.8-flash`, selectable compatible providers
+and local SearXNG search. The exact ISO from source
+`da74410f5d2584f0dacccb8d92764faeb8086e34`,
+[Rescue run 35489376408](https://github.com/0xfunboy/KernAid/actions/runs/35489376408),
+passed build, diagnosis-only repair-surface exclusion, BIOS, UEFI Secure Boot,
+snapshot and both USB-style two-boot gates. Its SHA-256 is
+`f6666e0d5598f0caf6705d112b982b43fa9303823510506ee24c43bda31c3f56`
+and it is available only through the authenticated diagnostic-candidate route.
+This is integrated virtual evidence for physical testing, not stable promotion:
+the private workflow intentionally excludes the separate Vault lifecycle,
+native prompt and qualified-release jobs. See
 [network-first implementation and verification](RESCUE_NETWORK_FIRST.md) for
-the new behavior, router limitation and remaining physical test gates.
+the behavior, router limitation and remaining physical test gates.
 
 Production work resumed on 19 September. The active batch hardens Wi-Fi
 activation by the assistant service, endpoint-bound credential isolation,
 wizard configuration restoration and production Pi/SearXNG packaging. The
-local runtime checks and Desk build passed; a new exact-image qualification
-is still required before changing the stable download.
+local runtime checks and Desk build passed; the exact private image matrix is
+now green. The next Consumer gate is the owner's physical network, UI and
+diagnosis check. The stable download remains unchanged.
 
-Latest private rebuild: source `7134b6e36d2b09cd1c10bcdd939a91601aa23f08`,
+Previous private rebuild: source `7134b6e36d2b09cd1c10bcdd939a91601aa23f08`,
 [Rescue run 35419841920](https://github.com/0xfunboy/KernAid/actions/runs/35419841920),
 with the staging permission fix and encrypted diagnostic retention. Image
 construction passed; the BIOS gate failed at the local assistant probe. The site
