@@ -13,14 +13,20 @@ process.umask(0o077);
 const socketPath =
   process.env.KERNAID_ASSISTANT_SOCKET ||
   "/run/kernaid-assistant/assistant.sock";
+const explicitKeyFile = process.env.KERNAID_ASSISTANT_KEY_FILE;
+const credentialDirectory = process.env.CREDENTIALS_DIRECTORY;
 const runtime = new AssistantRuntime({
   stateDir:
     process.env.KERNAID_ASSISTANT_STATE || "/run/kernaid-assistant/state",
   keyFile:
-    process.env.KERNAID_ASSISTANT_KEY_FILE ||
-    (process.env.CREDENTIALS_DIRECTORY
-      ? path.join(process.env.CREDENTIALS_DIRECTORY, "gemrouter.key")
+    explicitKeyFile ||
+    (credentialDirectory
+      ? path.join(credentialDirectory, "gemrouter.key")
       : undefined),
+  // systemd v257 presents system credentials as root-owned 0440 files inside
+  // a service-private 0550 directory. Ordinary key files retain the stricter
+  // owner-only permission requirement.
+  systemdCredential: !explicitKeyFile && Boolean(credentialDirectory),
   searchUrl: process.env.KERNAID_SEARCH_URL || "http://127.0.0.1:8888/search",
 });
 await runtime.initialize();

@@ -123,6 +123,11 @@ The local IPC, HTTP relay and browser deadlines are 125, 135 and 140 seconds
 The incoming browser Origin/Host check remains mandatory: it is distinct from
 the outgoing server-to-server request, which has no Origin header.
 
+Private testing media obtains its preconfigured provider credential through
+systemd `LoadCredential`. The runtime accepts systemd's service-private `0440`
+credential representation, while ordinary credential files remain restricted
+to owner-only permissions.
+
 The live Gemrouter endpoint rejects native tools with HTTP 400:
 `Tool calling is not supported on this router surface`. Its profile instead
 uses a bounded text protocol: the model emits exactly

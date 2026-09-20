@@ -34,6 +34,33 @@ test("provider discovery waits for a usable network adapter", () => {
   );
 });
 
+test("only systemd-managed credentials accept the protected 0440 mode", async () => {
+  const dir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "kernaid-assistant-credential-test-"),
+  );
+  const keyFile = path.join(dir, "gemrouter.key");
+  try {
+    await fs.writeFile(keyFile, "synthetic-test-only\n", { mode: 0o440 });
+    const ordinary = new AssistantRuntime({ stateDir: dir, keyFile });
+    await assert.rejects(
+      ordinary.initialize(),
+      /Cannot load private assistant credential/,
+    );
+    const managed = new AssistantRuntime({
+      stateDir: dir,
+      keyFile,
+      systemdCredential: true,
+    });
+    await managed.initialize();
+    assert.equal(managed.status().credentialPresent, true);
+    assert.ok(
+      !JSON.stringify(managed.status()).includes("synthetic-test-only"),
+    );
+  } finally {
+    await fs.rm(dir, { recursive: true });
+  }
+});
+
 test("reject credential-bearing/insecure endpoints and preserve escaped Wi-Fi names", () => {
   for (const value of [
     "http://example.com",

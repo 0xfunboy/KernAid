@@ -39,6 +39,11 @@ services started, but the private credential caused provider discovery before
 the no-NIC QEMU guest had a usable adapter. Automatic discovery is now gated on
 a connected Ethernet/Wi-Fi adapter and remains triggered after wizard
 connection/configuration; offline status and diagnosis stay immediately usable.
+The successor run `35487093116` reproduced the probe failure. Direct boot of its
+exact ISO showed the assistant restarting because systemd v257 exposes managed
+credentials as protected `0440` files, while the runtime required owner-only
+mode. The runtime now recognizes only the explicit systemd credential path as
+valid with `0440`; ordinary key files retain the owner-only rule.
 The first private dispatch, `35418400202`, stopped before image creation on
 one stale exact-package-list assertion. The `gnupg` expectation was updated
 without changing the OVMF hardening checks; the focused regression passes.

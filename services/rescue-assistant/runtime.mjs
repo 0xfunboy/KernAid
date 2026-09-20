@@ -239,11 +239,13 @@ export class AssistantRuntime {
   constructor({
     stateDir,
     keyFile,
+    systemdCredential = false,
     searchUrl = "http://127.0.0.1:8888/search",
     timeoutMs = 120_000,
   }) {
     this.stateDir = stateDir;
     this.keyFile = keyFile;
+    this.systemdCredential = systemdCredential;
     this.searchUrl = searchUrl;
     this.timeoutMs = timeoutMs;
     this.config = {
@@ -262,7 +264,11 @@ export class AssistantRuntime {
     if (this.keyFile) {
       try {
         const stat = await fs.lstat(this.keyFile);
-        if (!stat.isFile() || stat.mode & 0o077)
+        const permissions = stat.mode & 0o777;
+        const permissionsValid = this.systemdCredential
+          ? permissions === 0o400 || permissions === 0o440
+          : (permissions & 0o077) === 0;
+        if (!stat.isFile() || !permissionsValid)
           throw new Error("Private key file permissions required.");
         this.keys.set("gemrouter", {
           baseUrl: defaults.surfaces.gemrouter.baseUrl,
